@@ -1,6 +1,6 @@
 # RGCOPY documentation
 ***
-**Version: 0.9.69<BR>March 2026**
+**Version: 0.9.70<BR>April 2026**
 ***
 
 RGCOPY (**R**esource **G**roup **COPY**) is a tool that copies the most important resources of an Azure resource group (**source RG**) to a new resource group (**target RG**). It can copy a whole landscape consisting of many servers within a single Azure resource group to a new resource group. The target RG might be in a different region or subscription. RGCOPY has been tested on **Windows** and **Linux**
@@ -652,8 +652,6 @@ For the source RG, RGCOPY must know the mount points inside the VMs for all disk
 
 > :warning: **Warning:** Unlike other RGCOPY features, File Copy requires running code inside the source RG and the target RG. **Therefore, the stability of this feature depends on the OS and other running software inside the VMs.** Using this feature is on your own risk. To be on the save side, you should use database backup and restore rather than converting the database disks using RGCOPY.
 
-> :memo: **Note:** RGCOPY currently uses `tar` for File Copy which is quite slow during verify. Future versions of RGCOPY will replace `tar` with a differnt tool.
-
 There are several restrictions for using this feature:
 - Requirements for the source VMs:
     - NFS client must be installed
@@ -678,6 +676,7 @@ parameter|usage
 **`snapshotVolumes`** = <BR>`@("account/pool @ vol1,vol2...", ...)`<BR>`@("rg/account/pool @ vol1,vol2...", ...)`			|Create NetApp volume snapshots in the source RG<ul><li>**rg**: resource group name that contains the NetApp account (optional)</li><li>**account**: NetApp account name</li><li>**pool**: NetApp pool name</li><li>**vol**: NetApp volume name</li></ul>rg is optional. Default value is `sourceRG`
 **`subnetEndpoint`**=<BR>`'<vnet>/<subnet>'`|**[string]**: Existing subnet in source RG that can be used for RGCOPY NFS share during file copy.<BR><ul><li>**vnet**: name of the vnet </li><li>**subnet**: name of the subnet (normally `default`) </li></ul>The private endpoint network policies of this subnet must be disabled.
 **`subnetNetApp`**=<BR>`'<vnet>/<subnet>'`|**[string]**: Existing subnet in source RG that will be used for NetApp volumes during file copy.
+**`fileCopyVerify`**|**[string]**: Default value: `compare`<BR>allowed values:<ul><li>`none`: No veritfy after TAR backup (`tar -c`) and TAR restore (`tar -x`)</li><li> `verify`: running `tar -d` after TAR backup and TAR restore</li><li> `compare`: Comparing meta data using `tar -tv` and `find . -type f` after TAR backup</li></ul>
 
 ### Procedure
 When using file copy of mount points the following happens:
@@ -685,13 +684,13 @@ When using file copy of mount points the following happens:
 
 1. For each volume (parameter `snapshotVolumes`), the NetApp snapshot `rgcopy` is deleted and created again.
 2. The stortage account with the name `rgcopy<sourceRG>` is created in the source RG. Alternatively, you can define the name using parameter `sourceSA`. The NFS file share `rgcopy` is created in the storage account. A private endpoint is created in the NFS subnet (parameter `subnetEndpoint`) of the source RG.
-3. A backup script is started in each involved VM in the source RG. This script mounts the NFS share and backups the content of the mount points (parameters `createDisks`, `createVolumes`) to the NFS share. After that, the NFS share is unmounted (you can mount it again using bash script `/mnt/mntrgcopy.sh`).
+3. A backup script is started in each involved VM in the source RG. This script mounts the NFS share and backups the content of the mount points (parameters `createDisks`, `createVolumes`) to the file **`<vmName>/<mountPoint>/backup.tar`** in the NFS share **`rgcopy`**.
 4. The BICEP template contains new disks and volumes (parameters `createDisks`, `createVolumes`) and skips disks (parameter `skipDisks`). After deploying the BICEP template in the target RG, a private endpoint is created in the NFS subnet of the target RG.
-5. A restore script is started in each involved VM in the target RG. It partitions, formats and mounts newly created disks and changes `/etc/fstab`. After that, it mounts the NFS share and restores the files to the mount points (parameters `createDisks`, `createVolumes`). Then the NFS share is unmounted.
-6. The private endpoints to the NFS share in the target RG are deleted again.
-7. Neither the private endpoints to the NFS share in the source RG nor the NFS share and storage account are deleted in the source RG (as long as you do not set parameter `deleteBackups`). If you want to delete them later, you can start RGCOPY again with parameter `deleteBackupsOnly`.
+5. A restore script is started in each involved VM in the target RG. It partitions, formats and mounts newly created disks and changes `/etc/fstab`. After that, it mounts the NFS share and restores the files to the mount points (parameters `createDisks`, `createVolumes`).
+6. In the target RG, the private endpoints to the NFS share are deleted once all restore scripts (in all VMs) have finished.
+7. In the source RG, neither the private endpoints to the NFS share nor the NFS share and storage account are deleted (as long as you do not set parameter `deleteBackups`). If you want to delete them later, you can start RGCOPY again with parameter `deleteBackupsOnly`.
 
-
+When rebooting a VM in the source RG, the NFS share is unmounted. You can mount it again using bash script `/mnt/mntrgcopy.sh`.
 
 You can use the following scenarios:
 

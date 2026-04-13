@@ -1,7 +1,7 @@
 <#
 rgcopy.ps1:       Copy Azure Resource Group
-version:          0.9.69
-version date:     March 2026
+version:          0.9.70
+version date:     April 2026
 Author:           Martin Merdes
 Public Github:    https://github.com/Azure/RGCOPY
 
@@ -108,8 +108,10 @@ param (
 	,[array]  $justCopySnapshots 			# only copy these disks to SNAPSHOTs (from existing snapshots)
 	,[array]  $justCopyDisks				# only copy these disks (by creating snapshots and disks)
 	,[switch] $justStopCopyBlobs
+
 	,[Parameter(ParameterSetName='singleRG')]
 	[switch] $justCreateSnapshots		# just create snapshots in source RG
+
 	,[Parameter(ParameterSetName='singleRG')]
 	[switch] $justDeleteSnapshots		# just delete snapshots in source RG
 
@@ -126,6 +128,7 @@ param (
 	# use Parameter Set singleRG when switch cloneMode is set
 	,[Parameter(ParameterSetName='singleRG')]
 	 [switch] $cloneMode
+
 	,[int] $cloneNumber = 1
 	,$cloneVMs						= @()
 	,$attachVmssFlex 				= @()
@@ -141,6 +144,7 @@ param (
 	#--------------------------------------------------------------
 	,[Parameter(ParameterSetName='singleRG')]
 	 [switch] $mergeMode
+
 	,$setVmMerge = @()
 	# usage: $setVmMerge = @("$net/$subnet@$vm1,$vm2,...", ...)
 	#	with $net as virtual network name, $subnet as subnet name in target resource group
@@ -158,6 +162,7 @@ param (
 	# use Parameter Set singleRG when switch updateMode is set
 	,[Parameter(ParameterSetName='singleRG')]
 	 [switch] $updateMode									# change properties in source RG
+
 	# ,[switch] $simulate									# just simulate Updates
 	# ,[switch] $stopVMsSourceRG 							# parameter also available in Copy Mode, see above
 	# ,$setVmSize = @()										# parameter also available in Copy Mode, see below
@@ -179,6 +184,7 @@ param (
 	# use Parameter Set singleRG when switch patchMode is set
 	,[Parameter(ParameterSetName='singleRG')]
 	 [switch] $patchMode									# apply Linux patches
+
 	,$patchVMs					= '*'
 	# ,$takeVMs 				= @()
 	# ,$skipVMs 				= @()
@@ -208,8 +214,12 @@ param (
 	#--------------------------------------------------------------
 	# Azure NetApp Files
 	#--------------------------------------------------------------
-	,[string] $netAppServiceLevel	= 'Premium'				# Service Level for NetApp Capacity Pool: 'Standard', 'Premium', 'Ultra'
-	,[string] $netAppNetworkFeatures = 'Standard'			# Network Features for NetApp Volumes: 'Basic', 'Standard'
+	,[ValidateSet('Standard', 'Premium', 'Ultra')]
+	 [string] $netAppServiceLevel	= 'Premium'				# Service Level for NetApp Capacity Pool
+
+	,[ValidateSet('Basic', 'Standard')]
+	 [string] $netAppNetworkFeatures = 'Standard'			# Network Features for NetApp Volumes: 'Basic', 'Standard'
+
 	,[string] $netAppAccountName							# in Copy Mode: Name of new Account
 	,[string] $netAppPoolName								# in Copy Mode: Name of new Pool
 	,[int]    $netAppPoolGB 		= 4 * 1024				# in Copy Mode: Size of new Pool in GB
@@ -345,27 +355,6 @@ param (
 	# creates Proximity Placement Group 'ppgname'
 	# see also parameter $skipProximityPlacementGroup
 
-	,$createVolumes	= @()
-	# defines NetApp volumes for the target RG
-	# usage: $createVolumes = @("$size@$mp1,$mp2,...", ...)
-	#	with $size: volume size in GB (>= 100)
-	#	with $mp = $vmName/$pathToMountPoint
-
-	,$createDisks	= @()
-	# defines additional disks for the target RG
-	# usage: $createDisks = @("$size@$mp1,$mp2,...", ...)
-	#	with $size: disk size in GB (>= 1)
-	#	with $mp = $vmName/$pathToMountPoint
-
-	,$snapshotVolumes	= @()
-	# creates NetApp volume snapshots in the source RG
-	# usage: $snapshotVolumes = @("$rg/$account/$pool@$vol1,$vol2,...", ...)
-	# or:    $snapshotVolumes = @("$account/$pool@$vol1,$vol2,...", ...)
-	#	with $rg:      resource group name (default: $sourceRG) of NetApp account
-	#	with $account: NetApp account name
-	#	with $pool:    NetApp pool name
-	#	with $vol:     NetApp volume name
-
 	,$setVmDeploymentOrder	= @()
 	# deploy (start) VMs in specific order
 	# usage: $setVmDeploymentOrder = @("$prio@$vm1,$vm2,...", ...)
@@ -396,17 +385,47 @@ param (
 	,[switch] $renameDisks	# rename all disks using their VM name
 
 	#--------------------------------------------------------------
+	# parameters for file copy
+	#--------------------------------------------------------------
+	# ,$skipDisks	# see above
+
+	,$createVolumes	= @()
+	# defines NetApp volumes for the target RG
+	# usage: $createVolumes = @("$size@$mp1,$mp2,...", ...)
+	#	with $size: volume size in GB (>= 100)
+	#	with $mp = $vmName/$pathToMountPoint
+
+	,$createDisks	= @()
+	# defines additional disks for the target RG
+	# usage: $createDisks = @("$size@$mp1,$mp2,...", ...)
+	#	with $size: disk size in GB (>= 1)
+	#	with $mp = $vmName/$pathToMountPoint
+
+	,$snapshotVolumes	= @()
+	# creates NetApp volume snapshots in the source RG
+	# usage: $snapshotVolumes = @("$rg/$account/$pool@$vol1,$vol2,...", ...)
+	# or:    $snapshotVolumes = @("$account/$pool@$vol1,$vol2,...", ...)
+	#	with $rg:      resource group name (default: $sourceRG) of NetApp account
+	#	with $account: NetApp account name
+	#	with $pool:    NetApp pool name
+	#	with $vol:     NetApp volume name
+
+	,[ValidateSet('compare', 'verify', 'none')]
+	 $fileCopyVerify = 'compare'
+
+	#--------------------------------------------------------------
 	# parameters for storage account copy
 	#--------------------------------------------------------------
 	,$renameSa = @()
 	,$copySaShares 					= $false  	# $false, $true, or [array] of share names
 	,[switch] $copySaUsingSnapshots				# use RGCOPY snapshot of SMB/NFS share rather than share content
 	,[switch] $copySaRevokeCpAccess				# revoke access from control plane VM after content was copied
-	,[string] $copySaKeyName 		= 'key1'	# choose storage account key 'key1' or 'key2' (if SA key is used)
 	,$copySaEnvironment = @{					# environment variables set for azcopy
 		AZCOPY_DISABLE_SYSLOG		= 'true'
 		NO_PROXY 					= '*'
 	}
+	,[ValidateSet('key1', 'key2')]
+	 [string] $copySaKeyName 		= 'key1'	# choose storage account key 'key1' or 'key2' (if SA key is used)
 	,[switch] $justCopySaShares					# just copy containers and shares defined in copySaShares. No snapshots, no deployment
 
 	#--------------------------------------------------------------
@@ -425,7 +444,6 @@ param (
 	#--------------------------------------------------------------
 	# experimental parameters: DO NOT USE!
 	#--------------------------------------------------------------
-	,[boolean] $useBicep	= $True		# DEPRECATED: always use BICEP
 	,[switch] $skipGreenlist			# DEPRECATED: only needed when not using BICEP
 	,[switch] $allowRunningVMs			# DANGEROUS: allow snapshots of running VMs with more than one data disk
 	,[switch] $keepIdentities			# keep existing azSecPack identity (it will be re-created anyway)
@@ -459,6 +477,7 @@ $storageCredentialType = 'PSCRED'
 if ($useAzureCLI) {
 	$storageCredentialType = 'AZCLI'
 }
+$useBicep = $true
 
 #--------------------------------------------------------------
 # save parameters in $pwshParameters, $boundParameterNames
@@ -802,8 +821,6 @@ function test-names {
 							"Value must be at least 4096"
 	}
 
-	test-values 'netAppServiceLevel' $netAppServiceLevel @('Standard', 'Premium', 'Ultra')
-	test-values 'netAppNetworkFeatures' $netAppNetworkFeatures @('Basic', 'Standard')
 	test-values 'createDisksTier' $createDisksTier @('P2', 'P3', 'P4', 'P6', 'P10', 'P15', 'P20', 'P30', 'P40', 'P50')
 
 	#--------------------------------------------------------------
@@ -15007,10 +15024,10 @@ function invoke-mountPoint {
 	param (
 		$resourceGroup,
 		$scriptVm,
-		$scriptName
+		$scriptText
 	)
 
-	Write-Output $scriptName >$tempPathText
+	Write-Output $scriptText >$tempPathText
 
 	# script parameters
 	$parameter = @{
@@ -15056,19 +15073,46 @@ function wait-mountPoint {
 	write-logFile "Using credentials: $storageCredentialType"
 	write-logFile
 
+	# backup
+	if ($action -eq 'backup') {
+		if ($fileCopyVerify -eq 'compare') {
+			$finishText = '>> Compare finished*'
+		}
+		elseif ($fileCopyVerify -eq'verify') {
+			$finishText = '>> Verify finished*'
+		}
+		else {
+			$finishText = '>> Backup finished*'
+		}
+	}
+
+	# restore
+	else {
+		if ($fileCopyVerify -eq 'verify') {
+			$finishText = '>> Verify finished*'
+		}
+		else {
+			$finishText = '>> Restore finished*'
+		}	
+	}
+
 	$script:waitCount = 0
 	$allFiles = @()
 
 	do {
 		$done = $True
+
 		foreach ($task in $script:runningTasks) {
+
+			# get saved status
 			$vmName 	= $task.vmName
 			$mountpoint = $task.mountPoint
 			$fileName 	= $task.logRemote
 			$pathLocal 	= $task.logLocal
 			$status		= $task.status
 
-			if ($status -notlike '*Verify finished*') {
+			# get status if not already finished
+			if ($status -notlike $finishText) {
 				# read file from VM
 				$success = get-nfsFile $pathLocal $fileName "$vmName$mountpoint"	# $mountPoint starts with /
 				$status = 'status unknown'
@@ -15085,37 +15129,43 @@ function wait-mountPoint {
 							$lines = 10
 						}
 						for ($i = 1; $i -le $lines; $i++) {
-							if (($text[-$i] -like '*Verify finished*') `
-							-or ($text[-$i] -like 'ERROR*') `
-							-or ($text[-$i] -like ' *')) {
+							if ($text[-$i] -like ">*") {
 								$status = $text[-$i]
 								break
 							}
 						}
 					}				
 				}
+				$task.status = $status
 			}
 			
-			$task.status = $status
-
+			# display status
 			$s1 = $vmName.PadRight(22).Substring(0,22)
 			$s2 = $mountpoint.PadRight(20).Substring(0,20)
 
-			if ($status -like 'ERROR*') {
+			# status: error
+			if ($status -like '> ERROR*') {
 				write-logFile "$s1 $s2 $status" -ForegroundColor 'red'
 				$done = $true
 				break
 			}
-			elseif ($status -like '*Verify finished*') {
+
+			# status: finished
+			elseif ($status -like $finishText) {
 				write-logFile "$s1 $s2 $status" -ForegroundColor 'green'
+				# $done not changed (dependent on other tasks)
 			}
+
+			# status: unknown
 			elseif ($status -eq 'status unknown') {
-				$done = $false
 				write-logFile "$s1 $s2 $status" -ForegroundColor 'red'
-			}
-			else {
 				$done = $false
+			}
+
+			# status: x%
+			else {
 				write-logFile "$s1 $s2 $status" -ForegroundColor 'yellow'
+				$done = $false
 			}
 		}
 
@@ -15124,13 +15174,19 @@ function wait-mountPoint {
 			get-waitTime
 			write-logFile "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss \U\T\Cz')   $action running   next wait time: $script:waitTime minutes" -ForegroundColor 'DarkGray'
 			write-logFile
-			Start-Sleep -seconds (60 * $script:waitTime)
+			if ($script:waitTime -eq 0) {
+				Start-Sleep -seconds 10
+			}
+			else {
+				Start-Sleep -seconds (60 * $script:waitTime)
+			}
 		}
 
 	} while (!$done)
 	write-logFile
 
-	$verifyFailed = $false
+	# all tasks done. Print log file
+	$finishedAll = $true
 	$returnCodeWrong = $false
 	foreach ($file in $allFiles) {
 		write-taskStart "Log file summary: $file"
@@ -15140,7 +15196,7 @@ function wait-mountPoint {
 			write-logFileWarning "Could not read log file $file"
 		}
 
-		$verifyFound = $false
+		$finishedSingle = $false
 
 		foreach ($line in $text) {
 			if ($line -like '>>*') {
@@ -15153,28 +15209,31 @@ function wait-mountPoint {
 				}
 			}
 
-			if ($line -like '*Verify finished*') {
-				$verifyFound = $true
+			if ($line -like $finishText) {
+				$finishedSingle = $true
 			}
 		}
 
-		if (!$verifyFound) {
-			$verifyFailed = $true
+		if (!$finishedSingle) {
+			$finishedAll = $false
 		}
 		write-logFile
 	}
 
+	# all tasks done. Print summary
 	if ($returnCodeWrong) {
 		write-logFileError "Error when running TAR: Return code is not 0"
 	}
 
-	if ($verifyFailed) {
-		write-logFileError "Verify $action failed"
+	elseif (!$finishedAll) {
+		write-logFileError "At least one $action job failed"
 	}
 
-	write-logFile
-	write-logFile "All $action jobs finished" -ForegroundColor Blue
-	write-stepEnd
+	else {
+		write-logFile
+		write-logFile "All $action jobs finished" -ForegroundColor Blue
+		write-stepEnd
+	}
 }
 
 #--------------------------------------------------------------
@@ -15262,8 +15321,8 @@ function add-bashFile {
 #--------------------------------------------------------------
 	param (
 		$file,
-		[switch] $asJob,
 		[switch] $jobBegin,
+		[switch] $jobBody,
 		[switch] $jobEnd
 	)
 
@@ -15306,12 +15365,11 @@ function add-bashFile {
 		-creplace '\$BEGIN_FUNCTION_RESTORE',	'restore () {' `
 		-creplace '\$END_FUNCTION',				'}'
 
-	# replacement in job file
-	if ($createJobScript) {
-		# mask special characters
-		$text = ($text 	-replace '\\', '\\' `
-						-replace '\$', '\$' `
-						-replace '`',  '\`' )
+	if ($jobBody) {
+		# masking special characters not needed because using quoted 'heredoc'
+		# $text = ($text 	-replace '\\', '\\' `
+		# 					-replace '\$', '\$' `
+		# 					-replace '`',  '\`' )
 
 		# script files must not contain TEXT_EOF
 		if ($text -match 'EOF_JOB') {
@@ -15330,7 +15388,15 @@ function backup-mountPoint {
 	add-bashFile 'bash\backup_header.sh'
 	add-bashFile 'bash\mount-nfs.sh'
 	add-bashFile 'bash\backup-loop.sh' -jobBegin
-	add-bashFile 'bash\backup-job.sh' -asJob
+	# start backup job
+		add-bashFile 'bash\backup-job.sh' -jobBody
+	if ($fileCopyVerify -eq 'compare') {
+		add-bashFile 'bash\compare-job.sh' -jobBody
+	}
+	if ($fileCopyVerify -eq 'verify') {
+		add-bashFile 'bash\verify-job.sh' -jobBody
+	}
+	# end backup job
 	add-bashFile 'bash\backup-loop.sh' -jobEnd
 
 	$script:copyVMs.values
@@ -15342,11 +15408,6 @@ function backup-mountPoint {
 
 		# create script text
 		$script = "backup $sourceSA $vmName $TAR_BLOCKSIZE_KB " + $_.MountPoints.Path
-		if ($script:verbose) {
-			write-logFile
-			write-logFile $script
-			write-logFile
-		}
 
 		# run shell script
 		write-logFile
@@ -15378,7 +15439,12 @@ function restore-mountPoint {
 		add-bashFile 'bash\format-disks.sh'
 	}
 	add-bashFile 'bash\restore-loop.sh' -jobBegin
-	add-bashFile 'bash\restore-job.sh' -asJob
+	# start restore job
+		add-bashFile 'bash\restore-job.sh' -jobBody
+	if ($fileCopyVerify -eq 'verify') {
+		add-bashFile 'bash\verify-job.sh' -jobBody
+	}
+	# end restore job
 	add-bashFile 'bash\restore-loop.sh' -jobEnd
 
 	# get volumes in target RG

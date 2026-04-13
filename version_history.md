@@ -1,4 +1,10 @@
 ## Version history
+#### RGCOPY 0.9.70 April 2026
+type|change
+:---|:---
+feature|Improve verify performance of file copy. New parameter `fileCopyVerify`.
+feature|Remove deprecated parameter `useBicep`.
+
 #### RGCOPY 0.9.69 March 2026
 type|change
 :---|:---
