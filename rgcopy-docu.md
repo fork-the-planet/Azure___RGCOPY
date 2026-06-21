@@ -1,6 +1,6 @@
 # RGCOPY documentation
 ***
-**Version: 0.9.70<BR>April 2026**
+**Version: 0.9.71<BR>June 2026**
 ***
 
 RGCOPY (**R**esource **G**roup **COPY**) is a tool that copies the most important resources of an Azure resource group (**source RG**) to a new resource group (**target RG**). It can copy a whole landscape consisting of many servers within a single Azure resource group to a new resource group. The target RG might be in a different region or subscription. RGCOPY has been tested on **Windows** and **Linux**
@@ -28,7 +28,7 @@ RGCOPY has been developed for copying an SAP landscape and testing Azure with SA
 ### RGCOPY operation modes
 
 RGCOPY has different operation modes. By default, RGCOPY is running in Copy Mode. 
-- In **[Copy Mode](./rgcopy-docu.md#Workflow)**, an BICEP or ARM template is exported from the source RG, modified and deployed in the target RG. Disks are copied using snapshots. You can change several [resource properties](./rgcopy-docu.md#Resource-Configuration-Parameters) in the target RG:
+- In **[Copy Mode](./rgcopy-docu.md#Workflow)**, an BICEP template is exported from the source RG, modified and deployed in the target RG. Disks are copied using snapshots. You can change several [resource properties](./rgcopy-docu.md#Resource-Configuration-Parameters) in the target RG:
     - Changing **VM size**, disk performance tier, disk bursting, disk caching, Write Accelerator, Accelerated Networking
     - Adding, removing, and changing [availability](./rgcopy-docu.md#Parameters-for-Availability) configuration: **Proximity Placement Groups**, **Availability Sets**, **Availability Zones**, and **VM Scale Sets**
     - Converting **disk SKUs** `Premium_LRS`, `StandardSSD_LRS`, `Standard_LRS`, `Premium_ZRS`, `StandardSSD_ZRS`, `UltraSSD_LRS` and `PremiumV2_LRS` using (incremental) **snapshots** and snapshot copy. Changing the logical sector size is not possible.
@@ -140,11 +140,11 @@ In **Copy Mode**, the workflow of RGCOPY consists of the following steps. RGCOPY
 
 Step|parameter<BR>skip switch|usage
 :---|:---|:---
-:clock12: *create BICEP or ARM template*|**`skipArmTemplate`**|This step creates the BICEP (or ARM) template that will used for deploying in the target RG. <BR>:memo: **Note:** The template refers either to the snapshots in the source RG or target RG. Therefore, the template is only valid as long as these snapshots exist.<BR>:warning: **Warning:** Using various RGCOPY parameters, you can change [properties](./rgcopy-docu.md#Resource-Configuration-Parameters) of resources (e.g. VM size) compared with the Source RG. Be aware that some properties are changed to default values even when not explicitly using RGCOPY parameters.
+:clock12: *create BICEP template*|**`skipArmTemplate`**|This step creates the BICEP template that will used for deploying in the target RG. <BR>:memo: **Note:** The template refers either to the snapshots in the source RG or target RG. Therefore, the template is only valid as long as these snapshots exist.<BR>:warning: **Warning:** Using various RGCOPY parameters, you can change [properties](./rgcopy-docu.md#Resource-Configuration-Parameters) of resources (e.g. VM size) compared with the Source RG. Be aware that some properties are changed to default values even when not explicitly using RGCOPY parameters.
 :clock1: *create snapshots*|**`skipSnapshots`**|This step creates snapshots of disks (and [NetApp Volumes](./rgcopy-docu.md#File-Copy-of-NetApp-Volumes)) in the source RG. During this time, VMs with more than one data disk must be stopped. See section [Application Consistency](./rgcopy-docu.md#Application-Consistency) for details. <BR> :bulb: **Tip:** When setting parameter switch **`stopVMsSourceRG`**, RGCOPY stops *all* VMs in the source RG before creating snapshots.
 :clock2: *create backups*|**`skipBackups`**|This step is only needed when using (or converting) [NetApp Volumes](./rgcopy-docu.md#File-Copy-of-NetApp-Volumes) on LINUX. A file backup of specified mount points is created on an Azure NFS file share in the source RG.
 :clock3: *copy snapshots*|**`skipRemoteCopy`**|This step is needed when the source RG and the target RG are not in the same region. 
-:clock4: *deployment*||The deployment consists of several part steps:<ul><li>*deploy VMs:* Deploy BICEP (or ARM) template in the target RG.<BR>Part step can be skipped by **`skipDeployment`**</li><li>*restore backups:* Restore file backup on disks or [NetApp Volumes](./rgcopy-docu.md#File-Copy-of-NetApp-Volumes) in the target RG if needed.<BR> Part step can be skipped by **`skipRestore`**</li><li>*install VM Extensions*: install [VM Extensions](./rgcopy-docu.md#VM-Extensions) <BR>Part step can be skipped by **`skipExtensions`**</li></ul>
+:clock4: *deployment*||The deployment consists of several part steps:<ul><li>*deploy VMs:* Deploy BICEP template in the target RG.<BR>Part step can be skipped by **`skipDeployment`**</li><li>*restore backups:* Restore file backup on disks or [NetApp Volumes](./rgcopy-docu.md#File-Copy-of-NetApp-Volumes) in the target RG if needed.<BR> Part step can be skipped by **`skipRestore`**</li><li>*install VM Extensions*: install [VM Extensions](./rgcopy-docu.md#VM-Extensions) <BR>Part step can be skipped by **`skipExtensions`**</li></ul>
 :clock5: *start workload*| *optional step* | This step is used for testing SAP Workload. It has to be explicitly activated using switch **`startWorkload`**.
 :clock6: *cleanup*| *optional step* | By default, created snapshots in the source RG are not deleted by RGCOPY. <BR>:bulb: **Tip:** you can activate a cleanup using RGCOPY parameters. See section [Cost Efficiency](./rgcopy-docu.md#Cost-Efficiency) for details.
 
@@ -170,7 +170,7 @@ You can further change the behavior by setting the following parameters:
 **`useBlobCopy`** |**[switch]**: Always use BLOB copy.<BR>This parameter is only needed for testing because BLOB copy is much slower and less reliable.
 **`useSnapshotCopy`** |**[switch]**: Always use snapshot copy (even when source RG and target RG are in the same region).<BR>This parameter is only needed for testing.
 **`useIncSnapshots`** |**[switch]**: Always use incremental snapshots rather than full snapshots
-**`createDisksManually`** |**[switch]**: Do not use an ARM- or BICEP-template for creating disks (use `New-AzDisk` or a REST-API call instead)
+**`createDisksManually`** |**[switch]**: Do not use an BICEP-template for creating disks (use `New-AzDisk` or a REST-API call instead)
 **`skipDiskCreation`** |**[switch]**: Expect that all needed disks already exist in target RG
 **`justCopyDisks`** |**[switch]**: Only copy disks to target RG. Do not deploy anything else in target RG.
 **`useRestAPI`** |**[switch]**: Always Use REST-API calls instead of using `Grant-AzSnapshotAccess`, `New-AzDisk` and `New-AzSnapshot` (for snapshot copy)
@@ -206,7 +206,6 @@ By setting parameter `skipDiskCreation`, RGCOPY expects that all needed disks al
 ### Using Bicep
 As of version 0.9.50, Rgcopy is creating a BICEP template rather than an ARM template. Using BICEP has several advantages:
 - You can copy a source RG with more than 200 resources. This is not possible when using ARM templates caused by a limitation of `Export-AzResourceGroup`
-- BICEP always uses the newest API version for creating Azure resources. In ARM templates, you must define the API version manually.
 - RGCOPY copies all supported resources from the source RG. In addition, it copies all supported resources that are directly or indirectly referenced by a virtual machine, even when these resources are located in a different resource group (This was not the case in RGCOPY versions that used ARM templates).However, all VMs and all disks must be located in the source RG.
 For example, a VM might be part of a Proximity Placement Group (PPG) that is stored in a different resource group. In this case, the VM and the PPG are both copied and will be stored in the target RG. However, it is not possible to copy 2 resources with the same type and same name (for example, a VM is using 2 network interface cards: a NIC with name NIC1 in resource group RG1 and a NIC with name NIC1 in resource group RG2).
 - The created BICEP template is better readable compared with the ARM template. The ARM template contains more dependencies which caused some unexpected trouble, which is not the case anymore with BICEP.
@@ -304,6 +303,7 @@ The following resource configuration parameters exist:
 parameter|usage (data type is always [string] or [array])
 :---|:---
 **`setVmSize`** =<BR>`@("size @ vm1,vm2,...", ...)`	|Set VM Size: <ul><li>**size**: VM size (e.g. Standard_E32s_v3) </li><li>**vm**: VM name</li></ul> 
+**`setVmEncryptionAtHost`** = <BR>`@("bool @ vm1,vm2,...", ...)`		|Set Encryption At Host: <ul><li>**bool** in {True, False} </li><li>**vm**: VM name</li></ul> 
 **`setDiskSku`** =<BR>`@("sku @ disk1,disk2,...", ...)`			|Set Disk SKU (default value is **`Premium_LRS`**).<BR>When setting to `false` (or `$False` or `$Null`), the disk SKU is not changed.<ul><li>**sku** in {`Premium_LRS`, `StandardSSD_LRS`, `Standard_LRS`, `Premium_ZRS`, `StandardSSD_ZRS`, `PremiumV2_LRS`, `UltraSSD_LRS`, `false`} </li><li>**disk**: disk name</li></ul> :memo: **Note:** There are several restrictions:<ul><li> Converting **from** `PremiumV2_LRS` or `UltraSSD_LRS` requires incremental snapshots. Creating an 1TB disk from an incremental snapshot can take more then 1 hour.</li><li> Converting **to** `PremiumV2_LRS` or `UltraSSD_LRS` requires a zonal deployment. Therefore, parameter `setVmZone` must be used. </li><li> Converting **from** `PremiumV2_LRS` or `UltraSSD_LRS` to a different SKU is only possible if the logical sector size is 512.</li><li>When converting from a different SKU **to** `PremiumV2_LRS` or `UltraSSD_LRS`, the logical sector size is set to 512.</li><li>If the VM size does not support premium IO then the disk SKU is automatically adopted. For example, `Premium_ZRS` is converted to `StandardSSD_ZRS`.</li></ul>
 **`setDiskIOps`** = <BR>`@("iops @ disk1,disk1,...", ...)`|Set Disk IOps: <ul><li>**iops**: maximum IOs per second</li><li>**disk**: disk name</li></ul>:memo: **Note:** This parameter only works for Premium V2 disks. It cannot be used for Ultra SSD disks.
 **`setDiskMBps`** = <BR>`@("mbps @ disk1,disk1,...", ...)`|Set Disk MBps: <ul><li>**mbps**: maximum MB per second</li><li>**disk**: disk name</li></ul>:memo: **Note:** This parameter only works for Premium V2 disks. It cannot be used for Ultra SSD disks.
@@ -499,6 +499,53 @@ parameter|[DataType]: usage
 <div style="page-break-after: always"></div>
 
 ***
+## Applying OS patches
+RGCOPY can apply OS patches on all VMs of a resource group **in parallel**. This works for Windows, RedHat, Suse and Ubuntu VMs. RGCOPY automatically reboots the VMs and repeats applying OS patches if needed. By default, all available patches are applied on Windows and all security patches on Linux.
+To speed-up Windows update, the Powershell module **`PSWindowsUpdate`** is installed inside the Windows VMs. For Linux VMs, `zipper`, `yum` or `unattended-upgrade` is used.
+
+>:memo: **Note:** RGCOPY needs additional files in the directories `./bash` and `./powershell` for applying OS patches. It tests whether these files are fitting to the running RGCOPY version. RGCOPY works fine without these files as long as the OS patch feature (and file copy feature) is not used.
+
+### Applying OS patches in Copy Mode
+By setting parameter **`patchVMsTargetRG`**, OS Update is running on all copied VMs in the target RG just after deploying them. For example:
+
+```powershell
+$rgcopyParameter = @{
+    sourceRG            = 'SAP_master'
+    targetRG            = 'SAP_copy'
+    targetLocation      = 'westus'
+    patchVMsTargetRG    = 'patchVMsTargetRG'
+}
+.\rgcopy.ps1 @rgcopyParameter
+```
+
+### Applying OS patches in Patch Mode
+By default, RGCOPY is not changing the VMs in the source RG. However, you can manually update VMs in any resource group using RGCOPY patch mode:
+
+```powershell
+$rgcopyParameter = @{
+    patchMode   = $true
+    sourceRG    = 'rg_name'
+}
+.\rgcopy.ps1 @rgcopyParameter
+```
+
+### Parameters for patching
+The following parameters can be set in Patch Mode:
+
+parameter|[DataType]: usage
+:---|:---
+**`patchVMsTargetRG`**|**[switch]**: Patches VMs in Copy Modes
+**`patchMode`**|**[switch]**: Turns on Patch Mode.
+**`patchVMs`**|**[array]**: Name of VMs to patch: default value: `'*'`
+**`patchAll`**|**[switch]**: Install *all* available OS patches in the VM (not only security patches). This switch is always turned on for Windows VMs. The switch does not work for Ubuntu VMs. For these VMs, you must edit `/etc/apt/apt.conf.d/50unattended-upgrades` instead.
+**`ignorePatchErrors`** |**[switch]**: Ignore errors during OS patch installation (turned on by default).<BR>You can disable this switch by setting `ignorePatchErrors = $false`
+**`prePatchCommand`**|**[string]**: Linux command that will be executed before installing the patches, for example `yum-config-manager --save --setopt=rhui-rhel-7-server-dotnet-rhui-rpms.skip_if_unavailable=true 1>/dev/null`
+**`postPatchCommand`**|**[string]**: Linux command that will be executed after installing the patches
+
+RGCOPY does not try to fix any repository issue. Only fixes of enabled repositories are applied.
+
+
+***
 ## Copying Storage Accounts
 By default, RGCOPY does not copy storage accounts. However you can copy storage accounts including FILE and BLOB services when specifying new names for the storage accounts using parameter **`renameSa`**. For example:
 
@@ -650,12 +697,14 @@ NetApp volumes|NetApp volumes NFSv4.1|create new volumes
 
 For the source RG, RGCOPY must know the mount points inside the VMs for all disks and volumes. Hereby, RGCOPY can backup all files that are stored in these mount points to an NFS share in the source RG. In the target RG, new disks or volumes are created for these mount points. After that, RGCOPY restores the files from the NFS share to the mount points in the target RG.
 
+>:memo: **Note:** RGCOPY needs additional files in the directories `./bash` and `./powershell` for using file copy. It tests whether these files are fitting to the running RGCOPY version. RGCOPY works fine without these files as long as the file copy feature (and OS patch feature) is not used.
+
 > :warning: **Warning:** Unlike other RGCOPY features, File Copy requires running code inside the source RG and the target RG. **Therefore, the stability of this feature depends on the OS and other running software inside the VMs.** Using this feature is on your own risk. To be on the save side, you should use database backup and restore rather than converting the database disks using RGCOPY.
 
 There are several restrictions for using this feature:
 - Requirements for the source VMs:
     - NFS client must be installed
-    - `/etc/fstab` must be in specific format: `nofail` must be set for all disks and mount points. When skipping disks, the device names `/dev/sd*` might change. Therefore, you should use the Azure specific device names `/dev/disk/azure/scsi1/lun*-part*` instead.
+    - `/etc/fstab` must be in specific format: `nofail` must be set for all disks and mount points (except for `/`, `/boot`, `/boot/efi`). When skipping disks, the device names `/dev/sd*` (and `/dev/nvme*`) might change. Therefore, you should use the Azure specific device names, for example `/dev/disk/azure/scsi1/lun*-part*` (or `/dev/disk/azure/data/by-lun/*`).
     - For NetApp, the NFSv4 domain name should be set to `defaultv4iddomain.com`, see https://learn.microsoft.com/en-us/azure/azure-netapp-files/azure-netapp-files-configure-nfsv41-domain
 - Requirements in Azure
     - All NetApp volumes in the source RG must be configured to allow snapshot access inside the VMs.
@@ -1144,14 +1193,19 @@ $rgcopyParameter = @{
 ## Special cases
 
 ### VM Extensions
-RGCOPY automatically installs on Linux the VM extension `AzureMonitorLinuxAgent` and on Windows `AzureMonitorWindowsAgent`. 
+By default, RGCOPY installs the VM extension `AzureMonitorLinuxAgent` (on Linux) or `AzureMonitorWindowsAgent` (on Windows). RGCOPY ignores all errors related to a VM extension installation.
+
+
 You can skip this by using RGCOPY switch parameter **`skipExtensions`**. When parameter `autoUpgradeExtensions` is set then the extensions will automatically upgrade in the future.
 
-In addition, you can install the following extensions:
+You can configure VM extension installation using the following RGCOPY parameters:
 
 parameter|[DataType]: usage
 :---|:---
-**`installExtensionsSapMonitor`** |**[array]**: Names of VMs for deploying the SAP Monitor Extension.<BR>Alternatively, you can set the Azure tag `rgcopy.Extension.SapMonitor` for the VM. If you do not want to install the SAP Monitor Extension although the Azure tag has been set, use switch `ignoreTags`.
+**`skipExtensions`** |**[switch]**: Do not install any VM extension
+**`ignoreExtensionErrors`** |**[switch]**: Ignore errors during VM extension installation (turned on by default).<BR>You can disable this switch by setting `ignoreExtensionErrors = $false`
+**`autoUpgradeExtensions`** |**[switch]**: Install the extension with Auto-Upgrade property set.
+**`installExtensionsSapMonitor`** |Installs the **Azure VM extension for SAP solutions**<BR> **[array]**: Names of VMs for deploying this extension.<BR>Alternatively, you can set the Azure tag `rgcopy.Extension.SapMonitor` for the VM. If you do not want to install the SAP Monitor Extension although the Azure tag has been set, use switch `ignoreTags`.
 
 ### Cost Efficiency
 By default, RGCOPY does not delete all its intermediate storage (snapshots in source RG, file backups). This can save a lot of time when regularly copying the same resource group. However, the intermediate storage results in Azure charges.
@@ -1175,35 +1229,59 @@ The behavior of RGCOPY changed for copying NetApp volumes. It now starts only *n
 ## Appendix
 
 ### Supported Azure Resources
-RGCOPY copies the following resources from the source RG. **All other resources in the source Resource RG are skipped and not copied to the target RG**:
+RGCOPY copies the following resources from the **source RG**:
+
 - Microsoft.Compute/virtualMachines
 - Microsoft.Compute/disks
 - Microsoft.Network/virtualNetworks
 - Microsoft.Network/networkSecurityGroups
+- Microsoft.Network/applicationSecurityGroups
 - Microsoft.Network/networkInterfaces
 - Microsoft.Network/publicIPAddresses
 - Microsoft.Network/publicIPPrefixes
+- Microsoft.Network/routeTables
+- Microsoft.Network/privateDnsZones
+- Microsoft.Network/privateEndpoints
 - Microsoft.Network/loadBalancers
 - Microsoft.Network/natGateways
 - Microsoft.Compute/availabilitySets
 - Microsoft.Compute/proximityPlacementGroups
-- Microsoft.Compute/virtualMachineScaleSets
+- Microsoft.Compute/virtualMachineScaleSets (only VMSS Flex)
 - Microsoft.Network/bastionHosts
 - Microsoft.Storage/storageAccounts/fileServices
 - Microsoft.Storage/storageAccounts/blobServices
+- Microsoft.NetApp/netAppAccounts/capacityPools/volumes (using file copy)
 
+In addition, it copies the following resources from **other resource groups** (within the same subscription) if they are **referrenced** by any other copied resource:
 
+- Microsoft.Network/virtualNetworks
+- Microsoft.Network/networkSecurityGroups
+- Microsoft.Network/applicationSecurityGroups
+- Microsoft.Network/networkInterfaces
+- Microsoft.Network/publicIPAddresses
+- Microsoft.Network/publicIPPrefixes
+- Microsoft.Network/routeTables
+- Microsoft.Network/natGateways
+- Microsoft.Compute/availabilitySets
+- Microsoft.Compute/proximityPlacementGroups
+- Microsoft.Compute/virtualMachineScaleSets (only VMSS Flex)
 
-In the target RG, the following ARM resources might be deployed in addition:
+As long as you do not set parameter **`keepUnusedResources`**, the following resources are **not copied** if they are **not referrenced** by other resources:
+
+- Microsoft.Network/networkSecurityGroups
+- Microsoft.Network/applicationSecurityGroups
+- Microsoft.Network/publicIPAddresses
+- Microsoft.Network/publicIPPrefixes
+
+Resources that are not mentioned above are **not copied**, even if they are located in the source RG. RGCOPY can **only copy VMs that are located in the same region** as the source RG. Existing **snapshots are not copied**. However, RGCOPY creates its own snapshots for copying disks.
+
+Not all properties of the resources are copied, for example Network Peering is not copied. However, RGCOPY displays a warning for each property that is ignored by RGCOPY.
+
+In the **target RG**, the following ARM resources might be deployed in addition:
+
 - Microsoft.Compute/virtualMachines/extensions
 - Microsoft.NetApp/netAppAccounts
 - Microsoft.Compute/images
-
-**Not all properties of the resources are copied**, for example
-- The **DNS server** property of NICs is not copied. The old DNS server would not be accessible anyway in the target RG because the virtual network in the target RG is isolated.
-- **Network peering** is not copied.
-- RGCOPY can only copy VMs that are located in the same region as the source RG.
-
 
 ### Changes in the source RG
 - RGCOPY creates snapshots of all disks in the source RG with the name **\<diskname>.rgcopy**.

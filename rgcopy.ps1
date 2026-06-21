@@ -1,7 +1,7 @@
 <#
 rgcopy.ps1:       Copy Azure Resource Group
-version:          0.9.70
-version date:     April 2026
+version:          0.9.71
+version date:     June 2026
 Author:           Martin Merdes
 Public Github:    https://github.com/Azure/RGCOPY
 
@@ -65,12 +65,14 @@ param (
 	,[switch]   $waitRemoteCopy								# restart waiting for BLOB or snapshot copy 
 	,[switch] $skipDeployment								# skip deployment (in targetRG)
 	,[switch]   $skipExtensions								# do not install VM extensions
+	,[switch]   $ignoreExtensionErrors						# deploying BICEP will not fail if extension installation fails
 	,[switch] $skipRestore									# skip part step: restore files
 	,[switch]   $waitRestore								# restart waiting file copy (restore)
 	,[switch]   $stopRestore								# run all steps until (excluding) Restore
 	,[switch]   $continueRestore							# run Restore and all later steps
 	,[switch] $startWorkload								# start workload
 	,[switch] $stopVMsTargetRG 								# stop VMs in the target RG after deployment
+	,[switch] $patchVMsTargetRG 							# apply security patches on target VMs after deploying
 	,[switch] $deleteSnapshots								# delete snapshots after deployment
 	,[switch] $deleteTargetSA								# delete storage account in the target RG after deployment
 	,[switch] $deleteBackups
@@ -188,9 +190,10 @@ param (
 	,$patchVMs					= '*'
 	# ,$takeVMs 				= @()
 	# ,$skipVMs 				= @()
-	,[switch] $patchKernel			# install newest Linux kernel (and security patches)
 	,[switch] $patchAll				# install ALL patches on VM (not only security patches)
+	,[switch] $ignorePatchErrors	# ignore any error during OS Patch deployment
 	,[string] $prePatchCommand		# e.g. 'yum-config-manager --save --setopt=rhui-rhel-7-server-dotnet-rhui-rpms.skip_if_unavailable=true 1>/dev/null'
+	,[string] $postPatchCommand
 	,[switch] $skipPatch
 	,[switch] $forceExtensions
 	# ,[switch] $autoUpgradeExtensions
@@ -256,13 +259,13 @@ param (
 	,$skipDisks				= @()							# Names of DATA disks that will not be copied
 	,$skipSecurityRules		= @('SecurityCenter-JITRule*')	# Name patterns of rules that will not be copied
 	,$keepTags				= @('rgcopy*')					# Name patterns of tags that will be copied, all others will not be copied
+	,[switch] $keepUnusedResources							
 	,[switch] $skipVmssFlex									# do not copy VM Scale Sets Flexible
 	,[switch] $skipAvailabilitySet							# do not copy Availability Sets
 	,[switch] $skipProximityPlacementGroup					# do not copy Proximity Placement Groups
 	,[switch] $skipBastion									# do not copy Bastion
 	,[switch] $skipBootDiagnostics							# do not create Boot Diagnostics (managed storage account)
 	,[switch] $skipIdentities								# do not copy user assigned identities
-	,[switch] $skipNatGateway
 
 	#--------------------------------------------------------------
 	# resource configuration parameters
@@ -374,6 +377,10 @@ param (
 	# usage: $setAcceleratedNetworking = @("$bool@$nic1,$nic2,...", ...)
 	#	with $bool -in @('True', 'False')
 
+	,$setVmEncryptionAtHost = @()
+	# usage: $setVmEncryptionAtHost = @("$bool@$vm1,$vm2,...", ...)
+	#	with $bool -in @('True', 'False')
+
 	,$setVmName = @()
 	# renames VM resource name (not name on OS level)
 	# usage: $setVmName = @("$vmNameNew@$vmNameOld", ...)
@@ -449,6 +456,7 @@ param (
 	,[switch] $keepIdentities			# keep existing azSecPack identity (it will be re-created anyway)
 	,[switch] $skipStartSAP				# specific parameter for SAP tests
 	,[string] $monitorRG				# specific parameter for SAP tests
+	,[switch] $copyDNS
 	
 	# use tags for public IP addresses
 	,[string] $setIpTag
@@ -642,8 +650,15 @@ function set-paths {
 	$script:pathExportFolder = Resolve-Path $pathExportFolder
 
 	# filter out special characters for file names
+	$script:timestampSuffix = (Get-Date -Format 'yyyy-MM-dd__HH-mm-ss')
 	$sourceRG2 = $sourceRG -replace '\.', '-'   -replace '[^\w-_]', ''
 	$targetRG2 = $targetRG -replace '\.', '-'   -replace '[^\w-_]', ''
+	if ($justCopySaShares) {
+		$sourceRG2 = $sourceRG2 + '.shares'
+		$targetRG2 = $targetRG2 + '.shares'
+	}
+	$script:logPrefixSource		= "rgcopy.$sourceRG2"
+	$script:logPrefixTarget		= "rgcopy.$targetRG2"
 
 	# default file paths
 	$script:importPath 			= Join-Path -Path $pathExportFolder -ChildPath "rgcopy.$sourceRG2.SOURCE.json"
@@ -651,7 +666,10 @@ function set-paths {
 	if ($useBicep) {
 		$script:exportPath 		= Join-Path -Path $pathExportFolder -ChildPath "rgcopy.$targetRG2.TARGET.bicep"
 		$script:exportPathDisks = Join-Path -Path $pathExportFolder -ChildPath "rgcopy.$targetRG2.DISKS.bicep"
+		$script:exportPathVmExt = Join-Path -Path $pathExportFolder -ChildPath "rgcopy.$targetRG2.VMEXT.bicep"
 	}
+
+	# log path
 	$script:logPath				= Join-Path -Path $pathExportFolder -ChildPath "rgcopy.$targetRG2.TARGET.log"
 	if ($archiveMode) {
 		$script:logPath			= Join-Path -Path $pathExportFolder -ChildPath "rgcopy.$targetRG2.$sourceRG2.ARCHIVE.log"
@@ -660,7 +678,6 @@ function set-paths {
 		$script:logPath			= Join-Path -Path $pathExportFolder -ChildPath "rgcopy.$targetRG2.DISKS.$($justCopyDisks[0]).log"
 	}
 
-	$script:timestampSuffix 	= (Get-Date -Format 'yyyy-MM-dd__HH-mm-ss')
 	# fixed file paths
 	$script:tempPathText 		= Join-Path -Path $pathExportFolder -ChildPath "rgcopy.$targetRG2.TEMP.txt"
 	$script:zipPath 			= Join-Path -Path $pathExportFolder -ChildPath "rgcopy.$targetRG2.$timestampSuffix.zip"
@@ -712,6 +729,24 @@ function get-fileHashUTF8 {
 
     # Convert to string
     return ([BitConverter]::ToString($hash) -replace '-', '')
+}
+
+#--------------------------------------------------------------
+function assert-hashes {
+#--------------------------------------------------------------
+	param (
+		$text
+	)
+
+	if ($script:installationIssues.count -gt 0) {
+		write-logFileWarning $text
+
+		$script:installationIssues
+		| Select-Object file, issue
+		| write-LogFilePipe
+
+		write-logFileError "RGCOPY not installed correctly"
+	}
 }
 
 #--------------------------------------------------------------
@@ -779,7 +814,7 @@ function test-hashes {
 	}
 
 	if ($script:installationIssues.count -gt 0) {
-		write-logFileTab 'RGCOPY'	'Installation check failed (missing files in /bash)' -darkGray
+		write-logFileTab 'RGCOPY'	'Installation check failed (missing files)' -darkGray
 	}
 	else {
 		write-logFileTab 'RGCOPY'	'Installation check passed'					-darkGray
@@ -1461,15 +1496,23 @@ function write-logFileUpdates {
 	param (	
 		$resourceType,
 		$resource,
+
 		$action,
 		$value,
+
 		$comment1,
 		$comment2,
+		$warning,				# write warning
 		[switch] $NoNewLine,
 		[switch] $continue,
-		[switch] $defaultValue,
-		[switch] $valueWarning
+		[switch] $defaultValue,	# write value in gray, because it is the standard value
+		[switch] $valueWarning	# write value in yellow
 	)
+
+	# shorten type by given replacements
+	if ($null -ne $script:shortTypeName[$resourceType]) {
+		$resourceType = $script:shortTypeName[$resourceType]
+	}
 
 	# special color for variables
 	if ($resource -like '<*') {
@@ -1480,74 +1523,93 @@ function write-logFileUpdates {
 	}
 	
 	# constant for string lengths
-	$resourceTypeLength = 18
-	$resourceLength = 35
+	# $resourceTypeLength = 18
+	# $resourceLength = 35
+	$totalLength = 45
 
+	# continue
 	if ($continue) {
 		# first 2 parameters have different meaning
 		$action = $resourceType
 		$value = $resource
 	}
+
+	# output of resourceType/resource
 	else {
-		# multi-part name
+		# resource Type
+		Write-logFile -NoNewline "$resourceType/" -ForegroundColor 'DarkGray'
+
+		# resource Name
 		$parts = $resource -split '/'
-		$resourceType = $resourceType.PadRight($resourceTypeLength,' ').Substring(0,$resourceTypeLength)
-	
+		# multi-part name
 		if ($parts.count -gt 1) {
+
 			if ($parts[0].length -gt 14) {
 				$part1 = $parts[0].Substring(0,11) + '.../'
 			}
 			else {
 				$part1 = $parts[0] + '/'
 			}
-			$part2 = $parts[-1].PadRight($resourceLength - $part1.length,' ').Substring(0,$resourceLength - $part1.length)
-	
-			Write-logFile $resourceType -NoNewline -ForegroundColor 'DarkGray'
-			write-logFile $part1 -NoNewline -ForegroundColor 'DarkGray'
-			write-logFile $part2 -NoNewline -ForegroundColor $colorResource
+
+			$part2 = $parts[-1].PadRight(100,' ').Substring(0,($totalLength - $resourceType.Length - 1 - $part1.Length))
+			write-logFile -NoNewline $part1 -ForegroundColor 'DarkGray'
+			write-logFile -NoNewline $part2 -ForegroundColor $colorResource
 		}
+
+		# normal name
 		else {
-			if ($Null -eq $resource) {
-				write-logFileError "Internal RGCOPY error"
-			}
-		
-			$resource = $resource.PadRight($resourceLength,' ').Substring(0,$resourceLength)
-	
-			Write-logFile $resourceType -NoNewline -ForegroundColor 'DarkGray'
-			write-logFile $resource -NoNewline -ForegroundColor $colorResource
+			$resource = $resource.PadRight(100,' ').Substring(0,($totalLength - $resourceType.Length - 1))
+			write-logFile -NoNewline $resource -ForegroundColor $colorResource
 		}
 	}
 
+	# warning text
+	if ($null -ne $warning) {
+		write-logFile $warning -ForegroundColor 'yellow'
+		return
+	}
+
 	# colors for creation/deletion
-	if (($action -like 'delete*') -or ($action -like 'disable*') -or ($action -like 'enable*') -or ($action -like 'remove*') -or ($action -like 'skip*')) {
+	if (($action -like 'delete*') `
+	-or ($action -like 'disable*') `
+	-or ($action -like 'enable*') `
+	-or ($action -like 'remove*') `
+	-or ($action -like 'skip*')) {
+
 		$colorAction = 'Blue'
 	}
-	elseif (($action -like 'keep*') -or ($action -like 'no*') -or ($action -like 'has*')) {
+	elseif (($action -like 'keep*') `
+	    -or ($action -like 'no*') `
+	    -or ($action -like 'has*')) {
+
 		$colorAction = 'DarkGray'
 	}
 	else {
 		$colorAction = 'Green'
 	}
-
 	$value = $value -as [string]
+
+	# action value
+	Write-logFile -NoNewline "$action " -ForegroundColor $colorAction
+	if ($defaultValue) {
+		Write-logFile -NoNewline $value	 -ForegroundColor 'DarkGray'
+	}
+	elseif ($valueWarning) {
+		Write-logFile -NoNewline $value -ForegroundColor 'yellow'
+	}
+	else {
+		Write-logFile -NoNewline $value
+	}
+
+	# comment1
+	Write-logFile $comment1				-NoNewline -ForegroundColor 'Cyan'
+
+	# comment2
 	$len = $action.length + $value.length + $comment1.length + $comment2.length
 	if ($len -lt 24){
 		$pad = ' ' * (24 - $len)
 	}
 
-	Write-logFile "$action "			-NoNewline -ForegroundColor $colorAction
-	if ($defaultValue) {
-		Write-logFile $value			-NoNewline -ForegroundColor 'DarkGray'
-	}
-	else {
-		if ($valueWarning) {
-			Write-logFile $value -NoNewline -ForegroundColor 'yellow'
-		}
-		else {
-			Write-logFile $value -NoNewline
-		}
-	}
-	Write-logFile $comment1				-NoNewline -ForegroundColor 'Cyan'
 	if ($NoNewLine) {
 		Write-logFile "$comment2 $pad"	-NoNewline
 	}
@@ -1847,33 +1909,37 @@ function convertTo-array {
 		$script:errorOccured = $True
 	}
 
+
 	# empty input
 	if (($convertFrom.count -eq 0) -or ($convertFrom.length -eq 0)) {
 		Write-Output -NoEnumerate @()
-		return
 	}
 
-	# convert to array
-	if ($convertFrom -isnot [array]) {
+	# skalar input
+	elseif ($convertFrom -isnot [array]) {
 		Write-Output -NoEnumerate @($convertFrom)
-		return
 	}
 
-	# removes empty entries from array: $Null, '', @(). Does not remove @{}
-	$output = $convertFrom | Where-Object {$_.length -ne 0}
+	# array input
+	else {
+		# removes empty entries from input array: $Null, '', @(). Does not remove @{}
+		$output = $convertFrom | Where-Object {$_.length -ne 0}
+	
+		# empty output
+		if (($output.count -eq 0) -or ($output.length -eq 0)) {
+			Write-Output -NoEnumerate @()
+		}
 
-	# convert to array
-	if (($output.count -eq 0) -or ($output.length -eq 0)) {
-		Write-Output -NoEnumerate @()
-		return
-	}
-	if ($output -isnot [array]) {
-		Write-Output -NoEnumerate @($convertFrom)
-		return
-	}
+		# skalar output
+		elseif ($output -isnot [array]) {
+			Write-Output -NoEnumerate @($output)
+		}
 
-	# output of array
-	Write-Output -NoEnumerate $output
+		# array output
+		else {
+			Write-Output -NoEnumerate $output
+		}
+	}
 }
 
 #--------------------------------------------------------------
@@ -2239,7 +2305,11 @@ function get-resourceString {
 	)
 
 	$resID = "/subscriptions/$subscriptionID/resourceGroups/$resourceGroup/providers/$resourceArea/$mainResourceType/$mainResourceName"
-	if ($Null -ne $subResourceType) { $resID += "/$subResourceType/$subResourceName" }
+	
+	if ($Null -ne $subResourceType) {
+		$resID += "/$subResourceType/$subResourceName" 
+	}
+
 	return $resID
 }
 
@@ -2708,6 +2778,7 @@ function save-skuDefaultValue {
 			MemoryGB                        = 0
 			MaxDataDiskCount                = 9999
 			PremiumIO                       = $True
+			EncryptionAtHostSupported       = $false
 			MaxWriteAcceleratorDisksAllowed = 9999
 			MaxNetworkInterfaces            = 9999
 			AcceleratedNetworkingEnabled    = $True
@@ -2721,6 +2792,33 @@ function save-skuDefaultValue {
 }
 
 #--------------------------------------------------------------
+function convertTo-String {
+#--------------------------------------------------------------
+	param (
+		$value,
+		$separator
+	)
+
+	if ($null -ne $separator) {
+		$sep = $null
+		$string = ''
+		foreach ($item in $value) {
+			$string += "$sep$item"
+			$sep = $separator
+		}
+		return $string
+	}
+
+	elseif ($value.Length -eq 0) {
+		return $null
+	}
+
+	else {
+		return ($value -as [string]) # empty string <> $null
+	}
+}
+
+#--------------------------------------------------------------
 function convertTo-Boolean {
 #--------------------------------------------------------------
 	param (
@@ -2728,6 +2826,7 @@ function convertTo-Boolean {
 		[switch] $nullAsFalse
 	)
 
+	# NULL
 	if ($Null -eq $stringOrBool) {
 		if ($nullAsFalse) {
 			return $False
@@ -2736,9 +2835,13 @@ function convertTo-Boolean {
 			return $Null
 		}
 	}
+
+	# [boolean]
 	if ($stringOrBool -is [boolean]) {
 		return $stringOrBool
 	}
+
+	# [string]
 	elseif ($stringOrBool -is [string]) {
 		if ($stringOrBool -eq 'True') {
 			return $True
@@ -2747,9 +2850,30 @@ function convertTo-Boolean {
 			return $False
 		}
 	}
+
 	else {
 		write-logFileError "Internal RGCOPY error"
 	}
+}
+
+#--------------------------------------------------------------
+function get-skuProperties {
+#--------------------------------------------------------------
+	if ($Null -ne $script:skuProperties) {
+		return
+	}
+
+	set-context $targetSub # *** CHANGE SUBSCRIPTION **************
+
+	# get SKUs for all VM sizes in target
+	$script:skuProperties = Get-AzComputeResourceSku `
+								-Location $targetLocation `
+								-ErrorAction 'SilentlyContinue'
+
+	test-cmdlet 'Get-AzComputeResourceSku'  "Could not get SKU definition for region '$targetLocation'" `
+				"You can skip this step using RGCOPY parameter switch 'skipVmChecks'"
+
+	set-context -restore # *** CHANGE SUBSCRIPTION **************
 }
 
 #--------------------------------------------------------------
@@ -2763,21 +2887,10 @@ function save-skuProperties {
 		return
 	}
 
-	set-context $targetSub # *** CHANGE SUBSCRIPTION **************
-
-	# get SKUs for all VM sizes in target
-	if ($Null -eq $script:AzComputeResourceSku) {
-		$script:AzComputeResourceSku = Get-AzComputeResourceSku `
-										-Location		$targetLocation `
-										-ErrorAction	'SilentlyContinue'
-		test-cmdlet 'Get-AzComputeResourceSku'  "Could not get SKU definition for region '$region'" `
-					"You can skip this step using RGCOPY parameter switch 'skipVmChecks'"
-	}
-
-	set-context -restore # *** CHANGE SUBSCRIPTION **************
+	get-skuProperties
 
 	# max fault domain count
-	$script:AzComputeResourceSku
+	$script:skuProperties
 	| Where-Object ResourceType -eq 'availabilitySets'
 	| Where-Object Name -eq 'Aligned'
 	| ForEach-Object {
@@ -2791,8 +2904,8 @@ function save-skuProperties {
 	}
 
 	# VM SKUs
-	$script:AzComputeResourceSku
-	| Where-Object ResourceType -eq 'virtualMachines'
+	$script:skuProperties `
+	| Where-Object ResourceType -eq 'virtualMachines' `
 	| ForEach-Object {
 
 		$vmSize   = $_.Name
@@ -2804,6 +2917,7 @@ function save-skuProperties {
 		$MemoryGB                        = 0
 		$MaxDataDiskCount                = 9999
 		$PremiumIO                       = $True
+		$EncryptionAtHostSupported       = $false
 		$MaxWriteAcceleratorDisksAllowed = 0			# this property is not maintained in all SKUs
 		$MaxNetworkInterfaces            = 9999
 		$AcceleratedNetworkingEnabled    = $True
@@ -2824,6 +2938,7 @@ function save-skuProperties {
 				'MaxDataDiskCount'                  {$MaxDataDiskCount                = $cap.Value -as [int]; break}
 				'MemoryGB'                          {$MemoryGB                        = $cap.Value -as [int]; break}
 				'PremiumIO'                         {$PremiumIO                       = $capValueBoolean; break}
+				'EncryptionAtHostSupported'         {$EncryptionAtHostSupported       = $capValueBoolean; break}
 				'MaxWriteAcceleratorDisksAllowed'   {$MaxWriteAcceleratorDisksAllowed = $cap.Value -as [int]; break}
 				'MaxNetworkInterfaces'              {$MaxNetworkInterfaces            = $cap.Value -as [int]; break}
 				'AcceleratedNetworkingEnabled'      {$AcceleratedNetworkingEnabled    = $capValueBoolean; break}
@@ -2855,6 +2970,7 @@ function save-skuProperties {
 			MemoryGB                        = $MemoryGB
 			MaxDataDiskCount                = $MaxDataDiskCount
 			PremiumIO                       = $PremiumIO
+			EncryptionAtHostSupported		= $EncryptionAtHostSupported
 			MaxWriteAcceleratorDisksAllowed = $MaxWriteAcceleratorDisksAllowed
 			MaxNetworkInterfaces            = $MaxNetworkInterfaces
 			AcceleratedNetworkingEnabled    = $AcceleratedNetworkingEnabled
@@ -2883,13 +2999,11 @@ function compare-quota {
 	| ForEach-Object {
 
 		test-vmSize `
-			$targetLocation `
 			$_.VmZone `
 			$_.VmSize
 		
 		if ($updateMode) {
 			test-vmSize `
-				$targetLocation `
 				$_.VmZone `
 				$_.VmSizeOld `
 				-1
@@ -2904,7 +3018,6 @@ function compare-quota {
 	| ForEach-Object {
 
 		test-diskSku `
-			$targetLocation `
 			$_.DiskZone `
 			$_.SkuName `
 			$_.SizeGB `
@@ -2912,7 +3025,6 @@ function compare-quota {
 		
 		if ($updateMode) {
 			test-diskSku `
-				$targetLocation `
 				$_.DiskZone `
 				$_.SkuNameOld `
 				$_.SizeGBOld `
@@ -2924,7 +3036,6 @@ function compare-quota {
 	| ForEach-Object {
 
 		test-diskSku `
-			$targetLocation `
 			$_.DiskZone `
 			$_.SkuName `
 			$_.SizeGB `
@@ -2996,21 +3107,13 @@ function get-usedPercent {
 function test-vmSize {
 #--------------------------------------------------------------
 	param (
-		$region,
 		$zone,
 		$vmSize,
 		[int] $factor = 1 # or -1 for removing VM
 	)
 
-	if ($Null -eq $script:AzComputeResourceSku) {
-		$script:AzComputeResourceSku = Get-AzComputeResourceSku `
-										-Location		$region `
-										-ErrorAction	'SilentlyContinue'
-		test-cmdlet 'Get-AzComputeResourceSku'  "Could not get SKU definition for region '$region'" `
-					"You can skip this step using $pwshName parameter switch 'skipVmChecks'"
-	}
-
-	$sku = $script:AzComputeResourceSku
+	get-skuProperties
+	$sku = $script:skuProperties
 			| Where-Object ResourceType -eq 'virtualMachines'
 			| Where-Object Name -eq $vmSize
 
@@ -3059,7 +3162,7 @@ function test-vmSize {
 	# check region
 	if (($Null -eq $sku) -and !$useNewVmSizes) {
 		write-logFileWarning "VM Consistency check failed" `
-							"VM Size '$vmSize' not found in region '$region'" `
+							"VM Size '$vmSize' not found in region '$targetLocation'" `
 							"You can override this check using file 'newVmSizes.csv' and parameter 'useNewVmSizes'" `
 							-stopCondition $True
 	}
@@ -3068,7 +3171,7 @@ function test-vmSize {
 		# check zone
 		if (($Null -ne $sku.LocationInfo.Zones) -and ($zone -gt 0) -and ($zone -notin $sku.LocationInfo.Zones)) {
 			write-logFileWarning "VM Consistency check failed" `
-								"VM Size '$vmSize' not available in zone $zone of region '$region'" `
+								"VM Size '$vmSize' not available in zone $zone of region '$targetLocation'" `
 								"You can skip this check using $pwshName parameter switch 'skipVmChecks'" `
 								-stopCondition $True
 		}
@@ -3076,9 +3179,9 @@ function test-vmSize {
 		# check region restrictions
 		$restriction = $sku.Restrictions | Where-Object Type -eq 'Location'
 		if ($Null -ne $restriction) {
-			if ($region -in $restriction.RestrictionInfo.Locations) {
+			if ($targetLocation -in $restriction.RestrictionInfo.Locations) {
 				write-logFileWarning "VM Consistency check failed" `
-								"VM Size '$vmSize' not available in region '$region': $($restriction.ReasonCode)" `
+								"VM Size '$vmSize' not available in region '$targetLocation': $($restriction.ReasonCode)" `
 								"You can skip this check using $pwshName parameter switch 'skipVmChecks'" `
 								-stopCondition $True
 			}
@@ -3089,7 +3192,7 @@ function test-vmSize {
 		if ($Null -ne $restriction) {
 			if (($zone -gt 0) -and ($zone -in $restriction.RestrictionInfo.Zones)) {
 				write-logFileWarning "VM Consistency check failed" `
-									"VM Size '$vmSize' not available in in zone $zone of region '$region': $($restriction.ReasonCode)" `
+									"VM Size '$vmSize' not available in in zone $zone of region '$targetLocation': $($restriction.ReasonCode)" `
 									"You can skip this check using $pwshName parameter switch 'skipVmChecks'" `
 									-stopCondition $True
 			}
@@ -3184,7 +3287,6 @@ function test-vmQuota {
 function test-diskSku {
 #--------------------------------------------------------------
 	param (
-		$region,
 		$zone,
 		$diskSku,
 		$diskSizeGB,
@@ -3196,15 +3298,8 @@ function test-diskSku {
 		return
 	}
 
-	if ($Null -eq $script:AzComputeResourceSku) {
-		$script:AzComputeResourceSku = Get-AzComputeResourceSku `
-										-Location		$region `
-										-ErrorAction	'SilentlyContinue'
-		test-cmdlet 'Get-AzComputeResourceSku'  "Could not get SKU definition for region '$region'" `
-					"You can skip this step using $pwshName parameter switch 'skipVmChecks'"
-	}
-
-	$sku = $script:AzComputeResourceSku
+	get-skuProperties
+	$sku = $script:skuProperties
 			| Where-Object ResourceType -eq 'disks'
 			| Where-Object Name -eq $diskSku
 
@@ -3234,7 +3329,7 @@ function test-diskSku {
 	# check region
 	if ($Null -eq $sku) {
 		write-logFileWarning "Disk Consistency check failed" `
-							"Disk SKU '$diskSku' not available in region '$region'" `
+							"Disk SKU '$diskSku' not available in region '$targetLocation'" `
 							"You can skip this check using $pwshName parameter switch 'skipVmChecks'" `
 							-stopCondition $True
 	}
@@ -3243,7 +3338,7 @@ function test-diskSku {
 	# check zone
 	if (($Null -ne $sku.LocationInfo.Zones) -and ($zone -gt 0) -and ($zone -notin $sku.LocationInfo.Zones)) {
 		write-logFileWarning "Disk Consistency check failed" `
-							"Disk SKU '$diskSku' not available in zone $zone of region '$region'" `
+							"Disk SKU '$diskSku' not available in zone $zone of region '$targetLocation'" `
 							"You can skip this check using $pwshName parameter switch 'skipVmChecks'" `
 							-stopCondition $True
 	}
@@ -3251,9 +3346,9 @@ function test-diskSku {
 	# check region restrictions
 	$restriction = $sku.Restrictions | Where-Object Type -eq 'Location'
 	if ($Null -ne $restriction) {
-		if ($region -in $restriction.RestrictionInfo.Locations) {
+		if ($targetLocation -in $restriction.RestrictionInfo.Locations) {
 			write-logFileWarning "Disk Consistency check failed" `
-							"Disk SKU '$diskSku' not available in region '$region': $($restriction.ReasonCode)" `
+							"Disk SKU '$diskSku' not available in region '$targetLocation': $($restriction.ReasonCode)" `
 							"You can skip this check using $pwshName parameter switch 'skipVmChecks'" `
 							-stopCondition $True
 		}
@@ -3264,7 +3359,7 @@ function test-diskSku {
 	if ($Null -ne $restriction) {
 		if (($zone -gt 0) -and ($zone -in $restriction.RestrictionInfo.Zones)) {
 			write-logFileWarning "Disk Consistency check failed" `
-								"Disk SKU '$diskSku' not available in zone $zone of region '$region': $($restriction.ReasonCode)" `
+								"Disk SKU '$diskSku' not available in zone $zone of region '$targetLocation': $($restriction.ReasonCode)" `
 								"You can skip this check using $pwshName parameter switch 'skipVmChecks'" `
 								-stopCondition $True
 		}
@@ -4402,10 +4497,11 @@ function save-copyVMs {
 			MountPoints				= @()
 			VmssName				= $Null
 			AvsetName 				= $Null
-			Ppgname					= $Null
+			PpgName					= $Null
 			PlatformFaultDomain 	= $platformFaultDomain
 			DiskControllerType		= $vm.StorageProfile.DiskControllerType -as [string]
 			SecurityType			= $vm.SecurityProfile.SecurityType -as [string]
+			EncryptionAtHost		= convertTo-Boolean $vm.SecurityProfile.EncryptionAtHost -nullAsFalse
 		}
 	}
 }
@@ -4817,14 +4913,8 @@ function get-sourceVMs {
 		get-allFromTags $script:sourceVMs $sourceRG
 	}
 
-	if ($fileCopyNeeded -and ($script:installationIssues.count -gt 0)) {
-		write-logFileWarning "The following files are needed when using the file copy feature"
-
-		$script:installationIssues
-		| Select-Object file, issue
-		| write-LogFilePipe
-
-		write-logFileError "RGCOPY not installed correctly"
+	if ($fileCopyNeeded) {
+		assert-hashes "For the file copy feature, additional RGCOPY files are needed"
 	}
 }
 
@@ -5158,8 +5248,7 @@ function update-paramCreateDisks {
 	}
 
 	if ($script:snapshotList.count -lt $script:mountPointsCount) {
-		write-logFileWarning "Wrong/missing parameter 'snapshotVolumes' could result in data loss" `
-							"Is there a snapshot configured for all NetApp volumes (parameter 'snapshotVolumes')?" `
+		write-logFileWarning "Create snapshots for all NetApp volumes (parameter 'snapshotVolumes')" `
 							"- number of snapshots (snapshotVolumes): $($script:snapshotList.count)" `
 							"- number of mount points (createVolumes, createDisks): $script:mountPointsCount"
 	}
@@ -5752,13 +5841,6 @@ function update-paramSkipDisks {
 		}
 	}
 
-	# warning when skipDisks used:
-	if ($skipDisks.count -ne 0) {
-		write-logFileWarning "Parameter 'skipDisks' requires specific settings in /etc/fstab for LINUX VMs:" `
-							"- use UUID or /dev/disk/azure/scsi1/lun*-part*" `
-							"- use option 'nofail' for each disk"
-	}
-
 	# skip disks that are not attached to any VM
 	if (!$copyDetachedDisks) {
 		$detachedDisks = @()
@@ -5908,6 +5990,65 @@ function test-vmParameter {
 		}
 	}
 	return $checkedVMs
+}
+
+#--------------------------------------------------------------
+function update-paramsetVmEncryptionAtHost {
+#--------------------------------------------------------------
+	set-parameter 'setVmEncryptionAtHost' $setVmEncryptionAtHost
+	get-ParameterRule
+	while ($Null -ne $script:paramConfig) {
+
+		test-values 'setVmEncryptionAtHost' $script:paramConfig @('True','False') 'EncryptionAtHost'
+
+		$script:copyVMs.values
+		| Where-Object Name -in $script:paramVMs
+		| ForEach-Object {
+
+			$_.EncryptionAtHostNew = ($script:paramConfig -eq 'True')
+		}
+		get-ParameterRule
+	}
+
+	# output of changes
+	$script:copyVMs.Values
+	| Where-Object Skip -ne $True
+	| Sort-Object Name
+	| ForEach-Object {
+
+		$vmName 	= $_.Name
+		$vmSize 	= $_.VmSize
+		$current	= $_.EncryptionAtHost
+		$wanted		= $_.EncryptionAtHostNew
+		if ($Null -eq $wanted) {
+			$wanted = $current
+		}
+
+		# check if EncryptionAtHost is supported by vmSize
+		if ($wanted -eq $true) {
+			if (!$script:vmSkus[$vmSize].EncryptionAtHostSupported) {
+				$wanted = $false
+				write-logFileWarning "EncryptionAtHost not supported for $vmSize"
+			}
+		}
+
+		# update
+		if ($current -ne $wanted) {
+			$_.EncryptionAtHost = $wanted
+			$action = 'set'
+		}
+		else {
+			$action = 'keep'
+		}
+
+		# output
+		if ($_.EncryptionAtHost -eq $False) {
+			write-logFileUpdates 'virtualMachines' $vmName "$action EncryptionAtHost" $_.EncryptionAtHost -defaultValue
+		}
+		else {
+			write-logFileUpdates 'virtualMachines' $vmName "$action EncryptionAtHost" $_.EncryptionAtHost
+		}
+	}
 }
 
 #--------------------------------------------------------------
@@ -8639,12 +8780,13 @@ function update-nics2skip {
 			}
 		}
 
+		# resource was skipped in add-az_networkInterfaces
 		# get NICs for endpoints
-		foreach ($nic in $script:az_networkInterfaces) {
-			if ($Null -ne $nic.PrivateEndpoint.Id) {
-				$collected4endpoint += $nic.Name
-			}
-		}
+		# foreach ($nic in $script:az_networkInterfaces) {
+		# 	if ($Null -ne $nic.PrivateEndpoint.Id) {
+		# 		$collected4endpoint += $nic.Name
+		# 	}
+		# }
 	}
 	
 	# ARM
@@ -9172,7 +9314,7 @@ function update-FQDN {
 }
 
 #--------------------------------------------------------------
-function get-vmssFlex {
+function update-vmssFlex {
 #--------------------------------------------------------------
 	$script:deletedVmss = @()
 	
@@ -9342,7 +9484,9 @@ function new-vmssFlex {
 
 				# BICEP
 				if ($useBicep) {
-					$_.properties.virtualMachineScaleSet = get-bicepIdStructByType 'Microsoft.Compute/virtualMachineScaleSets' $vmssName
+					$_.properties.virtualMachineScaleSet = @{
+						id = "<$(get-bicepNameByType 'Microsoft.Compute/virtualMachineScaleSets' $vmssName).id>"
+					}
 				}
 
 				# ARM
@@ -9781,7 +9925,9 @@ function new-availabilitySet {
 
 			# BICEP
 			if ($useBicep) {
-				$_.properties.availabilitySet = get-bicepIdStructByType 'Microsoft.Compute/availabilitySets' $asName
+				$_.properties.availabilitySet = @{
+					id = "<$(get-bicepNameByType 'Microsoft.Compute/availabilitySets' $asName).id>"
+				}
 			}
 
 			# ARM
@@ -9804,7 +9950,9 @@ function new-availabilitySet {
 
 				# BICEP
 				if ($useBicep) {
-					$_.properties.proximityPlacementGroup = get-bicepIdStructByType 'Microsoft.Compute/proximityPlacementGroups' $ppgName
+					$_.properties.proximityPlacementGroup = @{
+						id = "<$(get-bicepNameByType 'Microsoft.Compute/proximityPlacementGroups' $ppgName).id>"
+					}
 				}
 
 				# ARM
@@ -9866,7 +10014,9 @@ function update-proximityPlacementGroup {
 
 			# BICEP
 			if ($useBicep) {
-				$_.properties.proximityPlacementGroup = get-bicepIdStructByType 'Microsoft.Compute/proximityPlacementGroups' $ppgName
+				$_.properties.proximityPlacementGroup = @{
+					id = "<$(get-bicepNameByType 'Microsoft.Compute/proximityPlacementGroups' $ppgName).id>"
+				}
 			}
 
 			# ARM
@@ -10079,6 +10229,7 @@ function update-paramAll {
 
 	# 1. setVmSize
 	update-paramSetVmSize
+	update-paramsetVmEncryptionAtHost
 
 	# 2. setDiskSku
 	update-paramSetDiskSku
@@ -10151,7 +10302,7 @@ function update-resourcesAll {
 		new-proximityPlacementGroup
 
 		# get or remove existing VMSS
-		get-vmssFlex
+		update-vmssFlex
 		
 		# new VMSS after removing ALL existing VMSS
 		new-vmssFlex
@@ -10249,6 +10400,7 @@ function update-vmSize {
 		$script:templateVariables."vmMemGb$name" = $MemoryGB
 
 		$_.properties.hardwareProfile.vmSize = $vmSize
+		$_.properties.securityProfile.encryptionAtHost = $script:copyVMs[$vmName].EncryptionAtHost
 	}
 }
 
@@ -10443,8 +10595,7 @@ function update-vmPriority {
 
 		# BICEP
 		if ($useBicep) {
-			$bicepName = get-bicepNameByType 'Microsoft.Compute/virtualMachines' $vmName
-			$nextDependentVMs += "<$bicepName>"
+			$nextDependentVMs += "<$(get-bicepNameByType 'Microsoft.Compute/virtualMachines' $vmName)>"
 		}
 
 		# ARM
@@ -10631,7 +10782,10 @@ function add-disksNew {
 
 					# BICEP
 					if ($useBicep) {
-						$dataDisk.managedDisk = get-bicepIdStructByType 'Microsoft.Compute/disks'	$diskName
+
+						$dataDisk.managedDisk = @{
+							id = "<$(get-bicepNameByType 'Microsoft.Compute/disks'	$diskName).id>"
+						}
 					}
 
 					# ARM
@@ -10913,7 +11067,9 @@ function update-images {
 
 		# BICEP
 		if ($useBicep) {
-			$_.properties.storageProfile.imageReference = get-bicepIdStructByType 'Microsoft.Compute/images' $imageName
+			$_.properties.storageProfile.imageReference  = @{
+				id = "<$(get-bicepNameByType 'Microsoft.Compute/images' $imageName).id>"
+			}
 		}
 
 		# ARM
@@ -11606,7 +11762,11 @@ function update-merge {
 		| ForEach-Object {
 
 			$_.properties.networkProfile = @{
-				networkInterfaces = @(get-bicepIdStructByType 'Microsoft.Network/networkInterfaces' $nicName)
+				networkInterfaces = @(
+					@{
+						id = "<$(get-bicepNameByType 'Microsoft.Network/networkInterfaces' $nicName).id>"
+					}
+				)
 			}
 		}
 
@@ -11643,9 +11803,10 @@ function update-merge {
 		# create and add publicIPAddress
 		if ($nameOld -in $script:mergeVMwithIP) {
 
-			$bicepStruct = get-bicepIdStructByType 'Microsoft.Network/publicIPAddresses' $ipName
 			# update NIC
-			$nicRes.properties.ipConfigurations[0].properties.publicIPAddress = $bicepStruct
+			$nicRes.properties.ipConfigurations[0].properties.publicIPAddress = @{
+				id = "<$(get-bicepNameByType 'Microsoft.Network/publicIPAddresses' $ipName).id>"
+			}
 
 			$mergeIPNames += $ipName
 
@@ -12347,60 +12508,77 @@ function invoke-localScript {
 function wait-vmAgent {
 #--------------------------------------------------------------
 	param (
-		$resourceGroup,
-		$scriptServer,
-		$pathScript
+		$rgName,
+		$scriptVm
 	)
 
 	for ($i = 1; $i -le $vmAgentWaitMinutes; $i++) {
 
 		# get current vmAgent Status
 		$vm = Get-AzVM `
-				-ResourceGroupName	$resourceGroup `
-				-Name				$scriptServer `
+				-ResourceGroupName	$rgName `
+				-Name				$scriptVm `
 				-status `
-				-WarningAction	'SilentlyContinue' `
+				-WarningAction 	'SilentlyContinue' `
 				-ErrorAction 'SilentlyContinue'
+		test-cmdlet 'Get-AzVM'  "Getting VM status failed"
 
 		$status  = $vm.VMAgent.Statuses.DisplayStatus
 		$version = $vm.VMAgent.VmAgentVersion
+		$osType  = $vm.StorageProfile.OsDisk.OsType
 
 		# status unknown
 		if ($Null -eq $status) {
-			test-cmdlet 'Get-AzVM'  "VM '$scriptServer' not found in resource group '$resourceGroup'"  -always
+			write-logFileError "Getting VM Agent status failed"
 		}
+		
 		# status ready
 		elseif ($status -eq 'Ready') {
-			write-logFile -ForegroundColor DarkGray "VM Agent status:     $status"
-			write-logFile -ForegroundColor DarkGray "VM Agent version:    $version"
+			write-logFile -ForegroundColor 'DarkGray' "VM Agent status:  $status"
+			write-logFile -ForegroundColor 'DarkGray' "VM Agent version: $version"
+			
+			if ((!$skipVmChecks) -and ($version.Length -gt 0)) {
+				try {
+					# test 3 parts of version
+					$v = [int[]] ($version -split '\.') + @(0,0,0,0)
+					# main version: 1 digit  -> shift 8
+					# mid version:  3 digits -> shift 5
+					# sub version:  5 digits
+					[int64] $versionInt64 = $v[2] + 100000 * $v[1] + 100000000 * $v[0]
 
-			# check minimum version 2.2.10
-			if (!$skipVmChecks) {
-				$v = $version -split '\.'
-				if ($v.count -ge 3) {
-					if ( (($v[0] -as [int]) -lt 2) `
-					-or ((($v[0] -as [int]) -eq 2) -and (($v[1] -as [int]) -lt 2)) `
-					-or ((($v[0] -as [int]) -eq 2) -and (($v[1] -as [int]) -eq 2) -and (($v[2] -as [int]) -lt 10))) {
+					# https://docs.microsoft.com/en-us/troubleshoot/azure/virtual-machines/support-extensions-agent-version
+					# check minimum version for Linux
+					if ($osType -eq 'Linux') {
+						$minVersionStr = '2.2.53.1'
+						[int64] $minVersionInt64 = 200200053
+					}
 
-						# https://docs.microsoft.com/en-us/troubleshoot/azure/virtual-machines/support-extensions-agent-version
-						write-logFileError "VM Agent version check failed: version $version is too old" `
-											"You can skip this check using RGCOPY parameter switch 'skipVmChecks'" `
-											"Update VM Agent of VM '$scriptServer' to the latest version"
+					# check minimum version for Windows
+					else {
+						$minVersionStr = '2.7.41491.1010'
+						[int64] $minVersionInt64 = 200741491
+					}
+
+					if ($versionInt64 -lt $minVersionInt64) {
+						write-logFileWarning "VM Agent version check failed: version $version is older than $minVersionStr" `
+											"You should update VM Agent of VM '$scriptVm' to the latest version"
 					}
 				}
+				catch {}
 			}
+
 			return
 		}
+
 		# status not ready yet
 		else {
-			write-logFile -ForegroundColor DarkGray "VM Agent Status:     $status ->waiting 1 minute..."
+			write-logFile -ForegroundColor 'DarkGray' "VM Agent Status:  $status ->waiting 1 minute..."
 			Start-Sleep -Seconds 60
 		}
 	}
 
 	# status not ready after 30 minutes ($vmAgentWaitMinutes)
-	write-logFileError "VM Agent of VM '$scriptServer' is not ready" `
-						"Script cannot be executed: '$pathScript'"
+	write-logFileError "VM Agent of VM '$scriptVm' is not ready"
 }
 
 #--------------------------------------------------------------
@@ -12558,7 +12736,7 @@ function invoke-vmScript {
 		write-logFile -ForegroundColor DarkGray "Virtual Machine:     " -NoNewLine
 		write-logFile "$vm ($osType)"
 		# check VM agent status and version
-		wait-vmAgent $resourceGroup $vm $scriptPath
+		wait-vmAgent $resourceGroup $vm
 		if ($isLocal) {
 			write-logFile -ForegroundColor DarkGray "Script Path (local): " -NoNewLine
 		}
@@ -13538,18 +13716,29 @@ function new-templateBicep {
 #--------------------------------------------------------------
 	$script:bicepNamesAll = @{}
 
+	# get zones from targetRG
+	get-skuProperties
+	$script:allTargetZones = $script:skuProperties.LocationInfo.Zones | Sort-Object -Unique
+
 	# --- start output resource changes
-	Write-logFile 'Resource                                             Changes by RGCOPY' -ForegroundColor 'Green'
-	Write-logFile '--------                                             -----------------' -ForegroundColor 'Green'
+	Write-logFile 'Resource                                     Changes by RGCOPY' -ForegroundColor 'Green'
+	Write-logFile '--------                                     -----------------' -ForegroundColor 'Green'
 
 	#--- create internal structures
 	$script:resourcesALL = @()
 	add-az_virtualMachines
+	add-az_privateEndpoints
 	add-az_virtualNetworks
 	add-az_networkInterfaces
 	add-az_publicIPAddresses
 	add-az_networkSecurityGroups
+	add-az_applicationSecurityGroups
 	add-az_bastionHosts
+	add-az_routeTables
+	if ($copyDNS) {
+		add-az_dnsZones
+	}
+	add-az_privateDnsZones
 	add-az_publicIPPrefixes
 	add-az_natGateways
 	add-az_proximityPlacementGroups
@@ -13567,52 +13756,67 @@ function new-templateBicep {
 
 	#--- create bicep
 	write-logFile
-	$script:bicep = @()			# normal deployment (1 template)
-	$script:bicepDisks = @()	# dual deployment (1st template)
-	$script:bicepOther = @()	# dual deployment (2nd template)
-	set-templateParameters ([ref] $script:bicepDisks)
-	set-templateParameters ([ref] $script:bicepOther)
+	$script:bicep = @()				# deploy everything
+	$script:bicepDisks = @()		# deploy disks only
+	$script:bicepExtensions = @()	# deploy VM extensions only
+	$script:bicepOther = @()		# deploy others (no disks, no VM extensions)
 	set-templateParameters ([ref] $script:bicep)
+	set-templateParameters ([ref] $script:bicepDisks)
+	set-templateParameters ([ref] $script:bicepExtensions)
+	set-templateParameters ([ref] $script:bicepOther)
 
 	foreach ($res in $script:resourcesALL) {
 
-		# other resources
-		if ($res.type -ne 'Microsoft.Compute/disks') {
-			$script:bicep				+= add-bicepResource $res
-			# $script:bicepDisks		+= @()
-			$script:bicepOther			+= add-bicepResource $res
-		}
-
 		# disk resource
-		else {
-			if ($script:createDisksManually) {
-				$script:bicep			+= add-bicepResource $res -existing
-				# $script:bicepDisks	+= @()
-				# $script:bicepOther	+= @()
-			}
+		if ($res.type -eq 'Microsoft.Compute/disks') {
+			$script:bicepDisks			+= add-bicepResource $res
 
-			elseif ($script:dualDeployment) {
-				# $script:bicep			+= @()
-				$script:bicepDisks 		+= add-bicepResource $res
+			if ($dualDeployment -or $createDisksManually) {
 				$script:bicepOther		+= add-bicepResource $res -existing
 			}
-
 			else {
 				$script:bicep 			+= add-bicepResource $res
-				# $script:bicepDisks	+= @()
-				# $script:bicepOther	+= @()
 			}
+		}
+
+		# # VM extension
+		# elseif ($res.type -eq 'Microsoft.Compute/virtualMachines/extensions') {
+		# 	$script:bicepExtensions 	+= add-bicepResource $res
+
+		# 	if (!$dualDeploymentVmExt) {
+		# 		$script:bicep			+= add-bicepResource $res
+		# 		$script:bicepOther		+= add-bicepResource $res		
+		# 	}
+		# }
+
+		# # VM
+		# elseif ($res.type -eq 'Microsoft.Compute/virtualMachines') {
+		# 	if ($dualDeploymentVmExt) {
+		# 		$script:bicepExtensions	+= add-bicepResource $res -existing
+		# 	}
+
+		# 	$script:bicep				+= add-bicepResource $res
+		# 	$script:bicepOther			+= add-bicepResource $res			
+		# }
+
+		# other resources
+		else {
+			$script:bicep				+= add-bicepResource $res
+			$script:bicepOther			+= add-bicepResource $res
 		}
 	}
 
 	# save templates
-	if ($script:dualDeployment) {
+	if ($dualDeployment) {
 		save-bicepFile $exportPathDisks ([ref] $script:bicepDisks)
 		save-bicepFile $exportPath      ([ref] $script:bicepOther)
 	}
 	else {
 		save-bicepFile $exportPath		([ref] $script:bicep)
 	}
+	# if ($dualDeploymentVmExt) {
+	# 	save-bicepFile $exportPathVmExt ([ref] $script:bicepExtensions)
+	# }
 }
 
 #--------------------------------------------------------------
@@ -13823,13 +14027,19 @@ function deploy-templateTarget {
 	$parameter.TemplateParameterObject = $script:deployParameters
 	write-logFileHashTable $parameter
 
+	if (!$skipExtensions -and $ignoreExtensionErrors) {
+		write-logFileWarning "Deployment errors of VM extensions will be ignored" `
+							"(can be changed by setting parameter ignoreExtensionErrors=`$false)"
+	}
+
 	# deploy
 	New-AzResourceGroupDeployment @parameter
 	| write-LogFilePipe
 	if (!$?) {
 		write-logFile $myDeploymentError -ForegroundColor 'yellow'
-		write-logFileError "Deployment '$DeploymentName' failed" `
-							"Check the Azure Activity Log in resource group $targetRG"
+		write-logFileWarning "Deployment '$DeploymentName' failed" `
+							"Check the Azure Activity Log in resource group $targetRG" `
+							-stopCondition ($DeploymentPath -ne $exportPathVmExt)
 	}
 
 	if ($targetSubAllowNSP -and $targetSubInternal) {
@@ -14093,10 +14303,22 @@ function start-VMsParallel {
 #--------------------------------------------------------------
 	param (
 		$resourceGroup,
-		$VmNames
+		$startVMs
 	)
 
-	$VmNames = $VmNames | Sort-Object -Unique
+	$VmNames = (Get-AzVM `
+					-ResourceGroupName $resourceGroup `
+					-status `
+					-WarningAction	'SilentlyContinue' `
+					-ErrorAction 'SilentlyContinue' `
+					| Where-Object Name -in $startVMs
+					| Where-Object PowerState -ne 'VM running').Name
+	test-cmdlet 'Get-AzVM'  "Could not get VMs of resource group $resourceGroup"
+	$VmNames = $VmNames | Sort-Object
+
+	if ($VmNames.Count -eq 0) {
+		return
+	}
 
 	# using parameters for parallel execution
 	$scriptParameter =  "`$resourceGroup = '$resourceGroup';"
@@ -14220,7 +14442,7 @@ function get-pathFromTags {
 		$vmName,
 		$tagName,
 		$tagValue, 
-		 $refPath,
+		[ref] $refPath,
 		$paramName
 	)
 
@@ -15024,17 +15246,15 @@ function invoke-mountPoint {
 	param (
 		$resourceGroup,
 		$scriptVm,
-		$scriptText
+		$scriptPath
 	)
-
-	Write-Output $scriptText >$tempPathText
 
 	# script parameters
 	$parameter = @{
 		ResourceGroupName 	= $resourceGroup
 		VMName            	= $scriptVM
 		CommandId         	= 'RunShellScript'
-		scriptPath 			= $tempPathText
+		scriptPath 			= $scriptPath
 		ErrorAction			= 'SilentlyContinue'
 	}
 
@@ -15058,7 +15278,6 @@ function invoke-mountPoint {
 		write-logFile        $result.Value[0].Message
 	}
 
-	Remove-Item -Path $tempPathText
 	return $status
 }
 
@@ -15263,8 +15482,9 @@ function get-nfsFile {
 		return $false
 	}
 
+	$uri = "https://$storageAccount.file.core.windows.net/$fileShare/$pathRemote/$fileName"
 	$invokeParam = @{
-		Uri				= "https://$storageAccount.file.core.windows.net/$fileShare/$pathRemote/$fileName"
+		Uri				= $uri
 		OutFile 		= $pathLocal
 		Headers			= @{ 
 			Authorization = "Bearer $token" 
@@ -15289,6 +15509,10 @@ function get-nfsFile {
 		}
 		catch {
 			write-logFile "readding NFS file using Rest API and $storageCredentialType failed"
+			if ($verboseLog) {
+				write-logFile "`$uri = '$uri'"
+				write-logFile "`$pathLocal = '$pathLocal'"
+			}
 			return $false
 		}
 	}
@@ -15407,14 +15631,17 @@ function backup-mountPoint {
 		$vmName = $_.Name
 
 		# create script text
-		$script = "backup $sourceSA $vmName $TAR_BLOCKSIZE_KB " + $_.MountPoints.Path
+		$scriptText = "$script:bashFile`n`nbackup $sourceSA $vmName $TAR_BLOCKSIZE_KB " + $_.MountPoints.Path
+		$scriptPath = Join-Path $pathExportFolder -ChildPath "$logPrefixSource.backupMP.$vmName.txt"
+		Write-Output $scriptText >$scriptPath
+		$script:logFiles += $scriptPath
 
 		# run shell script
 		write-logFile
 		write-taskStart "Backup volumes/disks of VM $vmName`:"
-		wait-vmAgent $sourceRG $vmName 'BACKUP VOLUMES/DISKS to NFS share'
+		wait-vmAgent $sourceRG $vmName
 
-		$rc = invoke-mountPoint $sourceRG $vmName "$script:bashFile`n`n$script"
+		$rc = invoke-mountPoint $sourceRG $vmName $scriptPath
 		if ($rc -ne 0) {
 			write-logFileError "Backup of mount points failed for resource group '$sourceRG'" `
 								"File Backup failed in VM '$vmName'" `
@@ -15495,18 +15722,18 @@ function restore-mountPoint {
 			}	
 		}
 
-		if ($script:verbose) {
-			write-logFile
-			write-logFile $script
-			write-logFile
-		}
+		# create script text
+		$scriptText = "$script:bashFile`n`n$script"
+		$scriptPath = Join-Path $pathExportFolder -ChildPath "$logPrefixTarget.restoreVm.$vmName.txt"
+		Write-Output $scriptText >$scriptPath
+		$script:logFiles += $scriptPath
 
 		# run shell script
 		write-logFile
 		write-taskStart "Restore volumes/disks of VM $vmName`:"
-		wait-vmAgent $targetRG $vmName 'RESTORE VOLUMES/DISKS from NFS share'
+		wait-vmAgent $targetRG $vmName
 
-		$rc = invoke-mountPoint $targetRG $vmName "$script:bashFile`n`n$script"
+		$rc = invoke-mountPoint $targetRG $vmName $scriptPath
 		if ($rc -ne 0) {
 			write-logFileError "Mount point restore failed for resource group '$targetRG'" `
 								"File restore failed in VM '$vmName'" `
@@ -15674,7 +15901,6 @@ function test-justCopyBlobsSnapshotsDisks {
 # Patch Mode
 		'patchMode'
 		'patchVMs'
-		'patchKernel'
 		'patchAll'
 		'prePatchCommand'
 		'skipPatch'
@@ -15985,10 +16211,9 @@ function test-mergeMode {
 		'deleteBastion'
 # Patch Mode
 		'patchMode'
-		'patchVMs'
-		'patchKernel'
-		'patchAll'
-		'prePatchCommand'
+		# 'patchVMs'
+		# 'patchAll'
+		# 'prePatchCommand'
 		'skipPatch'
 		# 'forceExtensions'
 		# 'skipExtensions'
@@ -16180,10 +16405,9 @@ function test-cloneMode {
 		'deleteBastion'
 # Patch Mode
 		'patchMode'
-		'patchVMs'
-		'patchKernel'
-		'patchAll'
-		'prePatchCommand'
+		# 'patchVMs'
+		# 'patchAll'
+		# 'prePatchCommand'
 		'skipPatch'
 		# 'forceExtensions'
 		# 'skipExtensions'
@@ -16404,7 +16628,6 @@ function test-archiveMode {
 # Patch Mode
 		'patchMode'
 		'patchVMs'
-		'patchKernel'
 		'patchAll'
 		'prePatchCommand'
 		'skipPatch'
@@ -16588,7 +16811,6 @@ if (!$updateMode) {
 # Patch Mode
 		'patchMode'
 		'patchVMs'
-		'patchKernel'
 		'patchAll'
 		'prePatchCommand'
 		'skipPatch'
@@ -16775,7 +16997,6 @@ if (!$patchMode) {
 # Patch Mode
 		# 'patchMode'
 		# 'patchVMs'
-		# 'patchKernel'
 		# 'patchAll'
 		# 'prePatchCommand'
 		# 'skipPatch'
@@ -16958,10 +17179,9 @@ function test-copyMode {
 		'deleteBastion'
 # Patch Mode
 		'patchMode'
-		'patchVMs'
-		'patchKernel'
-		'patchAll'
-		'prePatchCommand'
+		# 'patchVMs'
+		# 'patchAll'
+		# 'prePatchCommand'
 		'skipPatch'
 		# 'forceExtensions'
 		# 'skipExtensions'
@@ -17874,593 +18094,153 @@ function update-sourceBastion {
 }
 
 #--------------------------------------------------------------
-function get-az_used {
+# resources that are skipped when not referenced by other resources
+$script:types2Filter = @(
+	'publicIPPrefixes'
+	'publicIPAddresses'
+	'networkSecurityGroups'
+	'applicationSecurityGroups'
+)
+# DO NOT FILTER RESOURCE TYPES THAT HAVE SUB-RESOURCES
+# (code does not take care of this)
 #--------------------------------------------------------------
-	if ($script:resourceIDs.count -eq 0) {
-		return @()
-	}
-
-	# parse first Id
-	$r = get-resourceComponents $script:resourceIDs[0]
-	$type = $r.mainResourceType
-
-	switch ($type) {
-		'publicIPPrefixes'			{ $ref = [ref] $script:az_publicIPPrefixes }
-		'publicIPAddresses'			{ $ref = [ref] $script:az_publicIPAddresses }
-		'networkSecurityGroups'		{ $ref = [ref] $script:az_networkSecurityGroups }
-		'natGateways'				{ $ref = [ref] $script:az_natGateways }
-		Default						{ write-logFileError 'Internal error' }
-	}
-
-	$usedResources = @()
-	foreach ($res in $ref.Value) {
-		if ($res.id -in $script:resourceIDs) {
-			$usedResources += $res
-		}
-		else {
-			$r = get-resourceComponents $res.id
-			$name = $r.mainResourceName
-			write-logFileWarning "Skip unused $type '$name'"
-		}
-	}
-
-	return $usedResources
-}
-
-#--------------------------------------------------------------
-function get-az_remote {
+function save-az_all {
 #--------------------------------------------------------------
 	param (
-		$id
+		[ref] $ref, # reference to resources, e.g. [ref] $script:az_networkInterfaces
+		[switch] $noCount
 	)
 
-	# nothing to do
-	if ($Null -eq $id) {
-		return
+	$resources = @()
+	foreach ($res in $ref.Value) {
+		$type = ($res.type -split '/')[1]
+		$name = $res.name
+
+		# resource type not filtered
+		if ($type -notin $script:types2Filter) {
+			$resources += $res
+		}
+
+		# resource referenced
+		elseif ($script:referencedResources["$type`_$name"] -eq $true) {
+			$resources += $res
+		}
+
+		# resource not referenced
+		else {
+			if ($keepUnusedResources) {
+				write-logFileWarning "Copied $type '$name' not used"
+				$resources += $res
+			}
+			else {
+				write-logFileWarning "Skip unused $type '$name'"
+			}
+		}
 	}
 
-	# save resourceIDs
-	$script:resourceIDs += $id
+	# remove unused resources from $script:az_xxx
+	$ref.Value = $resources
+	# save used resources in $script:az_all 
+	$script:az_all += $resources
 
-	# parse Id
-	$r = get-resourceComponents $id
-	$subscriptionID 	= $r.subscriptionID
-	$type				= $r.mainResourceType
-	$name				= $r.mainResourceName
-	$resourceGroupName	= $r.resourceGroup
-
-	# no resources from different subscriptions allowed
-	if ($subscriptionID -ne $sourceSubID) {
-		write-logFileError "Resource '$name' of type '$type' is in wrong subscription" `
-							"Subscription ID is $subscriptionID" `
-							"Subscription ID of source RG is $sourceSubID"
+	if (!$noCount) {
+		write-logFile "$($resources.count) found" -ForegroundColor 'DarkGray'
+		write-logFile
 	}
-
-	# resource is in same resource group: nothing to do
-	if ($resourceGroupName -eq $sourceRG) {
-		return
-	}
-
-	switch ($type) {
-		'networkInterfaces'			{ $ref = [ref] $script:az_networkInterfaces }
-		'publicIPPrefixes'			{ $ref = [ref] $script:az_publicIPPrefixes }
-		'virtualNetworks'			{ $ref = [ref] $script:az_virtualNetworks }
-		'publicIPAddresses'			{ $ref = [ref] $script:az_publicIPAddresses }
-		'networkSecurityGroups'		{ $ref = [ref] $script:az_networkSecurityGroups }
-		'natGateways'				{ $ref = [ref] $script:az_natGateways }
-		'availabilitySets'			{ $ref = [ref] $script:az_availabilitySets }
-		'proximityPlacementGroups'	{ $ref = [ref] $script:az_proximityPlacementGroups }
-		'virtualMachineScaleSets'	{ $ref = [ref] $script:az_virtualMachineScaleSets }
-		Default						{ write-logFileError 'Internal error' }
-	}
-
-	$resource = $ref.Value | Where-Object {($_.Name -eq $Name) -and ($_.ResourceGroupName -eq $ResourceGroupName)}
-
-	# remote resource not already saved
-	if ($Null -ne $resource) {
-		return
-	}
-
-	write-logFileWarning "Reading $type '$Name' from resource group '$ResourceGroupName'..."
-	$param = @{
-		Name				= $Name
-		ResourceGroupName 	= $ResourceGroupName
-		WarningAction		= 'SilentlyContinue'
-		ErrorAction 		= 'SilentlyContinue'
-	}
-
-	switch ($type) {
-		'networkInterfaces'			{ $resource = Get-AzNetworkInterface @param }
-		'publicIPPrefixes'			{ $resource = Get-AzPublicIpPrefix @param }
-		'virtualNetworks'			{ $resource = Get-AzVirtualNetwork @param }
-		'publicIPAddresses'			{ $resource = Get-AzPublicIPAddress @param }
-		'networkSecurityGroups'		{ $resource = Get-AzNetworkSecurityGroup @param }
-		'natGateways'				{ $resource = Get-AzNatGateway @param }
-		'availabilitySets'			{ $resource = Get-AzAvailabilitySet @param }
-		'proximityPlacementGroups'	{ $resource = Get-AzProximityPlacementGroup @param }
-		'virtualMachineScaleSets'	{ $resource = Get-AzVmss @param }
-		Default					{ write-logFileError 'Internal error' }
-	}
-	test-cmdlet 'Get-Az*' "Could not get $type '$Name' of resource group '$ResourceGroupName'"
-
-	# add remote resource
-	$ref.Value += $resource
 }
 
 #--------------------------------------------------------------
-function get-az_local {
+function get-az_all {
 #--------------------------------------------------------------
 	param (
 		[switch] $vmsOnly
 	)
 
 	$script:az_all = @()
-	$script:resourceIDs = @()
-	#--------------------------------------------------------------
-	# virtualMachines (collect only from source RG)
-	#--------------------------------------------------------------
-	if (!$vmsOnly) {
-		write-logFile "Reading VMs from resource group $sourceRG..."
-	}
-	$script:az_virtualMachines = @( 
-		Get-AzVM `
-			-ResourceGroupName $sourceRG `
-			-WarningAction	'SilentlyContinue' `
-			-ErrorAction 'SilentlyContinue'
-	)
-	test-cmdlet 'Get-AzVM'  "Could not get VMs of resource group '$sourceRG'"
+	$script:azResults = @{}
+	$script:referencedResources = @{}
 
-	$script:az_all += $script:az_virtualMachines
-
-	if ($vmsOnly) {
-		return
-	}
-
-	#--------------------------------------------------------------
-	# disks (make sure that all disks are in source RG)
-	#--------------------------------------------------------------
-	# after: az_virtualMachines
-	write-logFile "Reading disks from resource group $sourceRG..."
-	$script:az_disks = $script:sourceDisks
-
-	# do not allow disks from other RGs
-	foreach ($vm in $script:az_virtualMachines) {
-		test-az_local $vm.StorageProfile.OsDisk.ManagedDisk.Id
-		foreach ($disk in $vm.StorageProfile.DataDisks) {
-			test-az_local $disk.Id
-		}
-	}
-
-	$script:az_all += $script:sourceDisks
-
-	#--------------------------------------------------------------
 	# snapshots (save snapshot names, only from source RG)
-	#--------------------------------------------------------------
-	write-logFile "Reading snapshots from resource group $sourceRG..."
+	write-logFile "Reading snapshots (RG $sourceRG)..."
+	save-az_all ([ref] $script:sourceSnapshots)
 
-	$script:az_all += $script:sourceSnapshots
-
-	#--------------------------------------------------------------
-	# networkInterfaces
-	#--------------------------------------------------------------
-	# after: az_virtualMachines
-	write-logFile "Reading NICs from resource group $sourceRG..."
-	$script:az_networkInterfaces = @( 
-		Get-AzNetworkInterface `
-			-ResourceGroupName $sourceRG `
-			-ErrorAction 'SilentlyContinue'
-	)
-	test-cmdlet 'Get-AzNetworkInterface'  "Could not get NICs of resource group '$sourceRG'"
-
-	# get NICs from other RGs
-	foreach ($vm in $script:az_virtualMachines) { 
-		foreach ($nic in $vm.NetworkProfile.NetworkInterfaces) {
-			get-az_remote $nic.Id
-		}
-	}
-
-	$script:az_all += $script:az_networkInterfaces
+	get-az_virtualMachines
+	# after az_virtualMachines
+	get-az_disks
 
 	if (!$cloneOrMergeMode) {
-		#--------------------------------------------------------------
-		# loadBalancers
-		#--------------------------------------------------------------
-		write-logFile "Reading loadBalancers from resource group $sourceRG..."
-		$script:az_loadBalancers = @( 
-			Get-AzLoadBalancer `
-				-ResourceGroupName $sourceRG `
-				-ErrorAction 'SilentlyContinue'
-		)
-		test-cmdlet 'Get-AzLoadBalancer'  "Could not get loadBalancers of resource group $sourceRG"
-
-		$script:az_all += $script:az_loadBalancers
-	}
-
-	if (!$cloneOrMergeMode) {
-		#--------------------------------------------------------------
-		# bastionHosts
-		#--------------------------------------------------------------
-		write-logFile "Reading Bastions from resource group $sourceRG..."
-		$script:az_bastionHosts = @( 
-			Get-AzBastion `
-				-ResourceGroupName $sourceRG `
-				-ErrorAction 'SilentlyContinue'
-		)
-		test-cmdlet 'Get-AzBastion'  "Could not get Bastions of resource group $sourceRG"
-
-		$script:az_all += $script:az_bastionHosts
-	}
-
-	#--------------------------------------------------------------
-	# virtualNetworks
-	#--------------------------------------------------------------
-	# after: az_networkInterfaces
-	# after: az_loadBalancers
-	# after: az_bastionHosts
-	write-logFile "Reading VNETs from resource group $sourceRG..."
-	$script:az_virtualNetworks = @( 
-		Get-AzVirtualNetwork `
-			-ResourceGroupName $sourceRG `
-			-ErrorAction 'SilentlyContinue'
-	)
-	test-cmdlet 'Get-AzVirtualNetwork'  "Could not get VNETs of resource group $sourceRG"
-
-	# get VNETs from other RGs
-	foreach ($nic in $script:az_networkInterfaces) { 
-		foreach ($conf in $nic.IpConfigurations) {
-			if ($Null -ne $conf.Subnet.Id) {
-				# get VNET ID
-				$s = $conf.Subnet.Id -split '/'
-				$vnetId = "/$($s[1])/$($s[2])/$($s[3])/$($s[4])/$($s[5])/$($s[6])/$($s[7])/$($s[8])"
-
-				get-az_remote $vnetId
-			}
+		if ($script:copySA.Count -gt 0) {
+			get-az_storageAccounts
 		}
+		get-az_privateEndpoints
+		get-az_loadBalancers
 	}
-
-	foreach ($lb in $script:az_loadBalancers) { 
-		foreach ($conf in $lb.FrontendIpConfigurations) {
-			if ($Null -ne $conf.Subnet.Id) {
-				# get VNET ID
-				$s = $conf.Subnet.Id -split '/'
-				$vnetId = "/$($s[1])/$($s[2])/$($s[3])/$($s[4])/$($s[5])/$($s[6])/$($s[7])/$($s[8])"
-
-				get-az_remote $vnetId
-			}
-		}
-	}
-
-	foreach ($bastion in $script:az_bastionHosts) { 
-		foreach ($conf in $bastion.IpConfigurations) {
-			if ($Null -ne $conf.Subnet.Id) {
-				# get VNET ID
-				$s = $conf.Subnet.Id -split '/'
-				$vnetId = "/$($s[1])/$($s[2])/$($s[3])/$($s[4])/$($s[5])/$($s[6])/$($s[7])/$($s[8])"
-
-				get-az_remote $vnetId
-			}
-		}
-	}
-
-	$script:az_all += $script:az_virtualNetworks
-
-	if (!$cloneOrMergeMode) {
-		if ($skipNatGateway) {
-			write-logFileWarning 'Skip NAT gateways'
-		}
-		else {
-			#--------------------------------------------------------------
-			# natGateways
-			#--------------------------------------------------------------
-			# after:virtualNetworks
-			write-logFile "Reading Gateways from resource group $sourceRG..."
-			$script:az_natGateways = @( 
-				Get-AzNatGateway `
-					-ResourceGroupName $sourceRG `
-					-ErrorAction 'SilentlyContinue'
-			)
-			test-cmdlet 'Get-AzNatGateway'  "Could not get Gateways of resource group $sourceRG"
 	
-			# collect used resources
-			$script:resourceIDs = @()
-
-			foreach ($net in $script:az_virtualNetworks) {
-				foreach ($subnet in $net.subnets) {
-					get-az_remote $subnet.NatGateway.Id
-				}
-			}
-
-			# remove unused resources
-			$script:az_natGateways = (get-az_used)
-			$script:az_all += $script:az_natGateways
-		}
-	}
-
-	if (!$cloneOrMergeMode) {
-		#--------------------------------------------------------------
-		# publicIPPrefixes
-		#--------------------------------------------------------------
-		# after: az_natGateways
-		# after: az_loadBalancers
-		write-logFile "Reading Public IP Prefixes from resource group $sourceRG..."
-		$script:az_publicIPPrefixes = @( 
-			Get-AzPublicIpPrefix `
-				-ResourceGroupName $sourceRG `
-				-ErrorAction 'SilentlyContinue'
-		)
-		test-cmdlet 'Get-AzPublicIpPrefix'  "Could not get Public IP Prefixes of resource group $sourceRG"
-
-		# collect used resources
-		$script:resourceIDs = @()
-
-		foreach ($gateway in $script:az_natGateways) { 
-			foreach ($prefix in $gateway.PublicIpPrefixes) {
-				get-az_remote $prefix.Id
-			}
-		}
-
-		foreach ($lb in $script:az_loadBalancers) { 
-			foreach ($conf in $lb.FrontendIpConfigurations) {
-				get-az_remote  $conf.PublicIPPrefix.Id
-			}
-		}
-
-		# remove unused resources
-		$script:az_publicIPPrefixes = (get-az_used)
-		$script:az_all += $script:az_publicIPPrefixes
-	}
-
-	#--------------------------------------------------------------
-	# publicIPAddresses
-	#--------------------------------------------------------------
-	# after: az_networkInterfaces
-	# after: az_bastionHosts
-	# after: az_natGateways
+	# after: az_privateEndpoints
+	# after: az_virtualMachines
 	# after: az_loadBalancers
-	write-logFile "Reading Public IPs from resource group $sourceRG..."
-	$script:az_publicIPAddresses = @( 
-		Get-AzPublicIPAddress `
-			-ResourceGroupName $sourceRG `
-			-ErrorAction 'SilentlyContinue'
-	)
-	test-cmdlet 'Get-AzPublicIPAddress'  "Could not get Public IP Addresses of resource group $sourceRG"
-
-	# collect used resources
-	$script:resourceIDs = @()
-
-	# get PublicIPs from other RGs
-	foreach ($nic in $script:az_networkInterfaces) { 
-		foreach ($conf in $nic.IpConfigurations) {
-			get-az_remote $conf.PublicIpAddress.Id
-		}
-	}
-
-	foreach ($bastion in $script:az_bastionHosts) { 
-		foreach ($conf in $bastion.IpConfigurations) {
-			get-az_remote $conf.PublicIpAddress.Id
-		}
-	}
-
-	foreach ($gateway in $script:az_natGateways) { 
-		foreach ($ip in $gateway.PublicIpAddresses) {
-			get-az_remote $ip.Id
-		}
-	}
-
-	foreach ($lb in $script:az_loadBalancers) { 
-		foreach ($conf in $lb.FrontendIpConfigurations) {
-			get-az_remote $conf.PublicIpAddress.Id
-		}
-	}
-
-	# remove unused resources
-	$script:az_publicIPAddresses = (get-az_used)
-	$script:az_all += $script:az_publicIPAddresses
+	get-az_networkInterfaces
 
 	if (!$cloneOrMergeMode) {
-		#--------------------------------------------------------------
-		# networkSecurityGroups
-		#--------------------------------------------------------------
+		get-az_bastionHosts
+
+		if ($copyDNS) {
+			get-az_dnsZones
+		}
+		# after: az_privateEndpoints
+		get-az_privateDnsZones
+	}
+
+	# after: az_networkInterfaces
+	# after: az_loadBalancers
+	# after: az_bastionHosts
+	# after: az_dnsZones
+	# after: az_privateDnsZones
+	# after: az_privateEndpoints
+	get-az_virtualNetworks
+
+	if (!$cloneOrMergeMode) {
+		# after:virtualNetworks
+		get-az_natGateways
+
+		# after:virtualNetworks
+		get-az_routeTables
+	}
+
+	# after: az_networkInterfaces
+	# after: az_natGateways
+	# after: az_dnsZones
+	# after: az_loadBalancers
+	# after: az_bastionHosts
+	get-az_publicIPAddresses
+
+	# after: az_natGateways
+	# after: az_dnsZones
+	# after: az_loadBalancers
+	# after: az_publicIPAddresses
+	get-az_publicIPPrefixes
+
+	if (!$cloneOrMergeMode) {
 		# after: az_virtualNetworks
 		# after: az_networkInterfaces
-		write-logFile "Reading NSGs from resource group $sourceRG..."
-		$script:az_networkSecurityGroups = @( 
-			Get-AzNetworkSecurityGroup `
-				-ResourceGroupName $sourceRG `
-				-ErrorAction 'SilentlyContinue'
-		)
-		test-cmdlet 'Get-AzNetworkSecurityGroup'  "Could not get NSGs of resource group $sourceRG"
+		get-az_networkSecurityGroups
 
-		# collect used resources
-		$script:resourceIDs = @()
+		# after: az_networkSecurityGroups
+		# after: az_privateEndpoints
+		get-az_applicationSecurityGroups
 
-		# get NSGs from other RGs
-		foreach ($net in $script:az_virtualNetworks) {
-			foreach ($subnet in $net.subnets) {
-				get-az_remote $subnet.NetworkSecurityGroup.Id
-			}
-		}
-
-		foreach ($nic in $script:az_networkInterfaces) {
-			get-az_remote $nic.NetworkSecurityGroup.Id
-		}
-
-		# remove unused resources
-		$script:az_networkSecurityGroups = (get-az_used)
-		$script:az_all += $script:az_networkSecurityGroups
-	}
-
-	if (!$cloneOrMergeMode) {
-		#--------------------------------------------------------------
-		# availabilitySets
-		#--------------------------------------------------------------
 		# after: az_virtualMachines
-		write-logFile "Reading Availability Sets from resource group $sourceRG..."
-		$script:az_availabilitySets = @( 
-			Get-AzAvailabilitySet `
-				-ResourceGroupName $sourceRG `
-				-ErrorAction 'SilentlyContinue'
-		)
-		test-cmdlet 'Get-AzAvailabilitySet'  "Could not get Availability Sets of resource group $sourceRG"
+		get-az_availabilitySets
 
-		foreach ($vm in $script:az_virtualMachines) { 
-			get-az_remote $vm.AvailabilitySetReference.Id
-		}
-
-		$script:az_all += $script:az_availabilitySets
-	}
-
-	if (!$cloneOrMergeMode) {
-		#--------------------------------------------------------------
-		# proximityPlacementGroups
-		#--------------------------------------------------------------
 		# after: az_virtualMachines
 		# after: az_availabilitySets
-		write-logFile "Reading PPGs from resource group $sourceRG..."
-		$script:az_proximityPlacementGroups = @( 
-			Get-AzProximityPlacementGroup `
-				-ResourceGroupName $sourceRG `
-				-ErrorAction 'SilentlyContinue'
-		)
-		test-cmdlet 'Get-AzProximityPlacementGroup'  "Could not get PPG of resource group $sourceRG"
+		get-az_proximityPlacementGroups
 
-		foreach ($vm in $script:az_virtualMachines) { 
-			get-az_remote $vm.ProximityPlacementGroup.Id
-		}
-
-		foreach ($avset in $script:az_availabilitySets) { 
-			get-az_remote $avset.ProximityPlacementGroup.Id
-		}
-
-		$script:az_all += $script:az_proximityPlacementGroups
-	}
-
-	if (!$cloneOrMergeMode) {
-		#--------------------------------------------------------------
-		# virtualMachineScaleSets
-		#--------------------------------------------------------------
 		# after: az_virtualMachines
-		write-logFile "Reading VMSS from resource group $sourceRG..."
-		$script:az_virtualMachineScaleSets = @( 
-			Get-AzVmss `
-				-ResourceGroupName $sourceRG `
-				-ErrorAction 'SilentlyContinue' `
-				-WarningAction 'SilentlyContinue'
-		)
-		test-cmdlet 'az_virtualMachineScaleSets'  "Could not get VMSS of resource group $sourceRG"
-
-		foreach ($vm in $script:az_virtualMachines) { 
-			get-az_remote $vm.VirtualMachineScaleSet.Id
-		}
-
-		$script:az_all += $script:az_virtualMachineScaleSets
+		get-az_virtualMachineScaleSets
 	}
 
-	if (!$cloneOrMergeMode) {
-		#--------------------------------------------------------------
-		# storageAccounts
-		#--------------------------------------------------------------
-		$script:az_storageAccounts = @()
-		$script:az_storageAccountsFileService = @()
-		$script:az_storageAccountsBlobService = @()
-		$script:az_storageContainers = @()
-		$script:az_storageShares = @()
-
-		write-logFile "Reading Storage Accounts from resource group $sourceRG..."
-		$storageAccounts = Get-AzStorageAccount `
-							-ResourceGroupName $sourceRG `
-							-ErrorAction 'SilentlyContinue' `
-							-WarningAction 'SilentlyContinue'
-		test-cmdlet 'Get-AzStorageAccount'  "Could not get Storage Accounts of resource group $sourceRG"
-
-		foreach ($sa in $storageAccounts) {
-			$sa = convertFrom-json (convertTo-json $sa -Depth 5 -EnumsAsStrings -WarningAction 'SilentlyContinue') -AsHashtable
-			$sa.Context = $null
-			$script:az_storageAccounts += $sa
-		}
-
-		foreach ($az_res in $script:az_storageAccounts) {
-			$name = $az_res.StorageAccountName
-
-			# get file storage properties
-			$fileServices = Get-AzStorageFileServiceProperty `
-								-ResourceGroupName $sourceRG `
-								-StorageAccountName $name `
-								-ErrorAction 'SilentlyContinue' `
-								-WarningAction 'SilentlyContinue'
-			if (!$?) {
-				if ($error[0].ToString() -notlike '*not supported for the account*') {
-					write-logFileWarning "Could not get File Service for storage account $name"
-				}
-			}
-
-			foreach ($fs in $fileServices) {
-				$script:az_storageAccountsFileService += $fs
-			}
-
-			# get blob storage properties
-			$blobServices = Get-AzStorageBlobServiceProperty `
-								-ResourceGroupName $sourceRG `
-								-StorageAccountName $name `
-								-ErrorAction 'SilentlyContinue' `
-								-WarningAction 'SilentlyContinue'
-			if (!$?) {
-				if ($error[0].ToString() -notlike '*not supported for the account*') {
-					write-logFile "Could not get Blob Service for storage account $name"
-				}
-			}
-
-			foreach ($bs in $blobServices) {
-				$script:az_storageAccountsBlobService += $bs
-			}
-		}
-
-		#--------------------------------------------------------------
-		# storageAccounts container and shares
-		#--------------------------------------------------------------
-		# You need to have a public network access or an IP rule
-
-
-		# get storage account container 
-		foreach ($az_res in $script:az_storageAccountsBlobService) {
-
-			$containers = Get-AzRmStorageContainer `
-							-ResourceGroupName $sourceRG `
-							-StorageAccountName $az_res.StorageAccountName `
-							-ErrorAction 'SilentlyContinue' `
-							-WarningAction 'SilentlyContinue'
-			test-cmdlet 'Get-AzRmStorageContainer'  "Could not get containers of storage account $name"
-
-			foreach ($container in $containers) {
-				$script:az_storageContainers += $container
-			}
-		}
-
-		# get storage account shares
-		foreach ($az_res in $script:az_storageAccountsFileService) {
-
-			$shares = Get-AzRmStorageShare `
-						-ResourceGroupName $sourceRG `
-						-StorageAccountName $az_res.StorageAccountName `
-						-ErrorAction 'SilentlyContinue' `
-						-WarningAction 'SilentlyContinue'
-			test-cmdlet 'Get-AzRmStorageShare'  "Could not get shares of storage account $name"
-
-			foreach ($share in $shares) {
-				$script:az_storageShares += $share
-			}
-		}
-
-		$script:az_all += $script:az_storageAccounts
-		$script:az_all += $script:az_storageAccountsFileService
-		$script:az_all += $script:az_storageAccountsBlobService
-		$script:az_all += $script:az_storageContainers
-		$script:az_all += $script:az_storageShares
-	}
-
-	#--------------------------------------------------------------
-	# save all
-	#--------------------------------------------------------------
+	# create JSON
 	write-logFile
 	$text = $script:az_all | ConvertTo-Json -Depth 5 -WarningAction 'SilentlyContinue'
 	Set-Content -Path $importPath -Value $text -ErrorAction 'SilentlyContinue'
@@ -18474,10 +18254,10 @@ function get-az_local {
 }
 
 #--------------------------------------------------------------
-function test-az_local {
+function get-az_remote {
 #--------------------------------------------------------------
 	param (
-		$id
+		$id # MAIN-resource or SUB-resource (but always use MAIN-resource)
 	)
 
 	# nothing to do
@@ -18485,49 +18265,817 @@ function test-az_local {
 		return
 	}
 
-	# parse Id
+	# parse Id (always get MAIN-resource, not SUB-resource)
 	$r = get-resourceComponents $id
-	$subscriptionID 	= $r.subscriptionID
-	$type				= $r.mainResourceType
-	$name				= $r.mainResourceName
-	$resourceGroupName	= $r.resourceGroup
+	$subscriptionID = $r.subscriptionID
+	$rgName			= $r.resourceGroup
+	$resourceArea	= $r.resourceArea
+	$type			= $r.mainResourceType
+	$name			= $r.mainResourceName
 
-	# different subscription
+	$script:referencedResources["$type`_$name"] = $true
+	
+	$mainResourceId = (get-resourceString `
+								$subscriptionID  $rgName `
+								$resourceArea `
+								$type  $name)
+
+	switch ($type) {
+		'networkInterfaces'			{ $ref = [ref] $script:az_networkInterfaces }
+		'publicIPPrefixes'			{ $ref = [ref] $script:az_publicIPPrefixes }
+		'virtualNetworks'			{ $ref = [ref] $script:az_virtualNetworks }
+		'publicIPAddresses'			{ $ref = [ref] $script:az_publicIPAddresses }
+		'networkSecurityGroups'		{ $ref = [ref] $script:az_networkSecurityGroups }
+		'applicationSecurityGroups'	{ $ref = [ref] $script:az_applicationSecurityGroups }
+		'natGateways'				{ $ref = [ref] $script:az_natGateways }
+		'availabilitySets'			{ $ref = [ref] $script:az_availabilitySets }
+		'proximityPlacementGroups'	{ $ref = [ref] $script:az_proximityPlacementGroups }
+		'virtualMachineScaleSets'	{ $ref = [ref] $script:az_virtualMachineScaleSets }
+		'privateDnsZones'			{ $ref = [ref] $script:az_privateDnsZones }
+		'dnsZones'					{ $ref = [ref] $script:az_dnsZones }
+		'routeTables'				{ $ref = [ref] $script:az_routeTables }
+		Default	{ 
+			write-logFileWarning "Reference to $type not processed"
+			return
+		}
+	}
+
+	# no resources from different subscriptions allowed
 	if ($subscriptionID -ne $sourceSubID) {
 		write-logFileError "Resource '$name' of type '$type' is in wrong subscription" `
-							"Subscription ID is: $subscriptionID" `
-							"Subscription ID should be: $sourceSubID"
+							"Subscription ID is $subscriptionID" `
+							"Subscription ID of source RG is $sourceSubID"
 	}
 
-	# different resource group
-	if ($resourceGroupName -ne $sourceRG) {
-		write-logFileError "Resource '$name' of type '$type' is in wrong resource group" `
-							"Resource group is: $resourceGroupName" `
-							"Resource group should be: $sourceRG"
+	# resource is in same resource group: nothing to do
+	if ($rgName -eq $sourceRG) {
+		return
+	}
+
+	# check if same name already used in other RG
+	$resource = $ref.Value | Where-Object {($_.Name -eq $name) -and ($_.ResourceGroupName -ne $rgName)}
+	if ($Null -ne $resource) {
+		write-logFileError "Resource type '$type' exists in two RGs using the same name: '$name'" `
+							"RG1: $rgName" `
+							"RG2: $($resource.ResourceGroupName)"
+	}
+
+	# check if remote resource already saved
+	$resource = $ref.Value | Where-Object {($_.Name -eq $name) -and ($_.ResourceGroupName -eq $rgName)}
+	if ($Null -ne $resource) {
+		return
+	}
+
+	# all az-cmdlets below have parameter 'resourceGroupName'
+	# not all of them have parameter 'ResourceId'
+	$param = @{
+		ResourceGroupName 	= $rgName
+		WarningAction		= 'SilentlyContinue'
+		ErrorAction 		= 'SilentlyContinue'
+	}
+
+	# check if resource group has not already been read
+	if ($null -eq $script:azResults["$type_$rgName"]) {
+
+		# read all resources (of same type) from remote RG at the same time
+		write-logFileWarning "Reading $type '$name' from resource group '$rgName'..."
+
+		switch ($type) {
+			'networkInterfaces'			{ $script:azResults["$type_$rgName"] = Get-AzNetworkInterface @param }
+			'publicIPPrefixes'			{ $script:azResults["$type_$rgName"] = Get-AzPublicIpPrefix @param }
+			'virtualNetworks'			{ $script:azResults["$type_$rgName"] = Get-AzVirtualNetwork @param }
+			'publicIPAddresses'			{ $script:azResults["$type_$rgName"] = Get-AzPublicIPAddress @param }
+			'networkSecurityGroups'		{ $script:azResults["$type_$rgName"] = Get-AzNetworkSecurityGroup @param }
+			'applicationSecurityGroups'	{ $script:azResults["$type_$rgName"] = Get-AzApplicationSecurityGroup @param }
+			'natGateways'				{ $script:azResults["$type_$rgName"] = Get-AzNatGateway @param }
+			'availabilitySets'			{ $script:azResults["$type_$rgName"] = Get-AzAvailabilitySet @param }
+			'proximityPlacementGroups'	{ $script:azResults["$type_$rgName"] = Get-AzProximityPlacementGroup @param }
+			'virtualMachineScaleSets'	{ $script:azResults["$type_$rgName"] = Get-AzVmss @param }
+			'privateDnsZones'			{ $script:azResults["$type_$rgName"] = Get-AzPrivateDnsZone @param }
+			'dnsZones'					{ $script:azResults["$type_$rgName"] = Get-AzDnsZone @param }
+			'routeTables'				{ $script:azResults["$type_$rgName"] = Get-AzRouteTable @param }
+			Default { 
+				write-logFileError 'Internal error' 
+			}
+		}
+		test-cmdlet 'Get-Az*' "Could not get $type '$name' of resource group '$rgName'"
+	}
+
+	# add remote resource
+	$itemFound = $false
+	foreach ($item in $script:azResults["$type_$rgName"]) {
+		if ($item.Id -eq $mainResourceId) {
+			$ref.Value += $item
+			$itemFound = $true
+		}
+	}
+
+	if (!$itemFound) {
+		write-logFileWarning "Referenced Resource not found: $mainResourceId"
 	}
 }
 
 #--------------------------------------------------------------
-function get-NameByBicepName {
+function get-az_virtualMachines {
+#--------------------------------------------------------------
+	write-logFile "Reading VMs (RG $sourceRG)..."
+
+	$script:az_virtualMachines = @( 
+		Get-AzVM `
+			-ResourceGroupName $sourceRG `
+			-WarningAction	'SilentlyContinue' `
+			-ErrorAction 'SilentlyContinue'
+	)
+	test-cmdlet 'Get-AzVM'  "Could not get VMs of resource group '$sourceRG'"
+
+	save-az_all ([ref] $script:az_virtualMachines)
+}
+
+#--------------------------------------------------------------
+function get-az_disks {
+#--------------------------------------------------------------
+	write-logFile "Reading disks (RG $sourceRG)..."
+
+	# disks have already been read
+	$script:az_disks = $script:sourceDisks
+
+	foreach ($vm in $script:az_virtualMachines) {
+		# make sure that all VM disks are in source RG
+		test-az_local $vm.StorageProfile.OsDisk.ManagedDisk.Id
+		foreach ($disk in $vm.StorageProfile.DataDisks) {
+			# make sure that all VM disks are in source RG
+			test-az_local $disk.Id
+		}
+	}
+
+	save-az_all ([ref] $script:sourceDisks)
+}
+
+#--------------------------------------------------------------
+function get-az_networkInterfaces {
+#--------------------------------------------------------------
+	write-logFile "Reading NICs (RG $sourceRG)..." -NoNewLine
+
+	$script:az_networkInterfaces = @( 
+		Get-AzNetworkInterface `
+			-ResourceGroupName $sourceRG `
+			-ErrorAction 'SilentlyContinue'
+	)
+	test-cmdlet 'Get-AzNetworkInterface'  "Could not get NICs of resource group '$sourceRG'"
+
+	# get NICs from other RGs
+	write-logFile "Reading NICs (other RGs) referenced by VMs..."
+	foreach ($vm in $script:az_virtualMachines) { 
+		foreach ($nic in $vm.NetworkProfile.NetworkInterfaces) {
+			get-az_remote $nic.Id
+		}
+	}
+
+	write-logFile "Reading NICs (other RGs) referenced by Private Endpoints..."
+	foreach ($ep in $script:az_privateEndpoints) {
+		foreach ($id in $ep.NetworkInterfaces.Id) {
+			get-az_remote $id
+		}
+	}
+
+	write-logFile "Reading NICs (other RGs) referenced by Load Balancers..."
+	foreach ($lb in $script:az_loadBalancers) { 
+		foreach ($pool in $lb.BackendAddressPools) {
+			foreach ($addr in $pool.LoadBalancerBackendAddresses) {
+				get-az_remote $addr.NetworkInterfaceIpConfiguration.Id
+			}
+		}
+	}
+
+	save-az_all ([ref] $script:az_networkInterfaces)
+}
+
+#--------------------------------------------------------------
+function get-az_loadBalancers {
+#--------------------------------------------------------------
+	write-logFile "Reading loadBalancers (RG $sourceRG)..."
+
+	$script:az_loadBalancers = @( 
+		Get-AzLoadBalancer `
+			-ResourceGroupName $sourceRG `
+			-ErrorAction 'SilentlyContinue'
+	)
+	test-cmdlet 'Get-AzLoadBalancer'  "Could not get loadBalancers of resource group $sourceRG"
+
+	save-az_all ([ref] $script:az_loadBalancers)
+}
+
+#--------------------------------------------------------------
+function get-az_bastionHosts {
+#--------------------------------------------------------------
+	write-logFile "Reading Bastions (RG $sourceRG)..."
+
+	$script:az_bastionHosts = @( 
+		Get-AzBastion `
+			-ResourceGroupName $sourceRG `
+			-ErrorAction 'SilentlyContinue'
+	)
+	test-cmdlet 'Get-AzBastion'  "Could not get Bastions of resource group $sourceRG"
+
+	save-az_all ([ref] $script:az_bastionHosts)
+}
+
+#--------------------------------------------------------------
+function get-az_dnsZones {
+#--------------------------------------------------------------
+	write-logFile "Reading DNS Zones (RG $sourceRG)..."
+
+	$script:az_dnsZones = @( 
+		Get-AzDnsZone `
+			-ResourceGroupName $sourceRG `
+			-ErrorAction 'SilentlyContinue'
+	)
+	test-cmdlet 'Get-AzDnsZone'  "Could not get DNS Zones of resource group $sourceRG"
+
+	#--------------------------------------------------------------
+	$script:az_dnsRecordSets = @()
+	foreach ($dnsZone in $script:az_dnsZones) {
+		$zoneName = $dnsZone.Name
+		$script:az_dnsRecordSets += `
+			Get-AzDnsRecordSet `
+				-Zone $dnsZone `
+				-ErrorAction 'SilentlyContinue'
+		test-cmdlet 'Get-AzDnsRecordSet'  "Could not get Record Set of DNS zone '$zoneName'"
+	}
+
+	save-az_all ([ref] $script:az_dnsZones)
+	save-az_all ([ref] $script:az_dnsRecordSets) -noCount
+}
+
+#--------------------------------------------------------------
+function get-az_privateDnsZones {
+#--------------------------------------------------------------
+	write-logFile "Reading Private DNS Zones (RG $sourceRG)..."
+
+	$script:az_privateDnsZones = @( 
+		Get-AzPrivateDnsZone `
+			-ResourceGroupName $sourceRG `
+			-ErrorAction 'SilentlyContinue'
+	)
+	test-cmdlet 'Get-AzPrivateDnsZone'  "Could not get Private DNS Zones of resource group $sourceRG"
+
+	# get DNS zones from other RGs
+	write-logFile "Reading Private DNS Zones (other RGs) referenced by Private Endpoints..."
+	foreach ($zg in $script:az_privateDnsZoneGroups) {
+			get-az_remote $zg.PrivateDnsZoneId
+	}
+
+	#--------------------------------------------------------------
+	$script:az_privateDnsVirtualNetworkLinks = @()
+	foreach ($dnsZone in $script:az_privateDnsZones) {
+		$zoneName = $dnsZone.Name
+		$script:az_privateDnsVirtualNetworkLinks += `
+			Get-AzPrivateDnsVirtualNetworkLink `
+				-ResourceGroupName $sourceRG `
+				-ZoneName $zoneName `
+				-ErrorAction 'SilentlyContinue'
+		test-cmdlet 'Get-AzPrivateDnsVirtualNetworkLink'  "Could not get Virtual Network Link of Private DNS zone '$zoneName'"
+	}
+
+	#--------------------------------------------------------------
+	$script:az_privateDnsRecordSets = @()
+	foreach ($dnsZone in $script:az_privateDnsZones) {
+		$zoneName = $dnsZone.Name
+		$script:az_privateDnsRecordSets += `
+			Get-AzPrivateDnsRecordSet `
+				-Zone $dnsZone `
+				-ErrorAction 'SilentlyContinue'
+		test-cmdlet 'Get-AzPrivateDnsRecordSet'  "Could not get Record Set of Private DNS zone '$zoneName'"
+		
+	}
+
+	save-az_all ([ref] $script:az_privateDnsZones)
+	save-az_all ([ref] $script:az_privateDnsVirtualNetworkLinks) -noCount
+	save-az_all ([ref] $script:az_privateDnsRecordSets) -noCount
+}
+
+#--------------------------------------------------------------
+function get-az_virtualNetworks {
+#--------------------------------------------------------------
+	write-logFile "Reading VNETs (RG $sourceRG)..."
+
+	$script:az_virtualNetworks = @( 
+		Get-AzVirtualNetwork `
+			-ResourceGroupName $sourceRG `
+			-ErrorAction 'SilentlyContinue'
+	)
+	test-cmdlet 'Get-AzVirtualNetwork'  "Could not get VNETs of resource group $sourceRG"
+
+	# get VNETs from other RGs
+	write-logFile "Reading VNETs (other RGs) referenced by NICs..."
+	foreach ($nic in $script:az_networkInterfaces) { 
+		foreach ($conf in $nic.IpConfigurations) {
+			get-az_remote $conf.Subnet.Id
+		}
+	}
+
+	write-logFile "Reading VNETs (other RGs) referenced by Load Balancers..."
+	foreach ($lb in $script:az_loadBalancers) { 
+		foreach ($conf in $lb.FrontendIpConfigurations) {
+			get-az_remote $conf.Subnet.Id
+		}
+		foreach ($pool in $lb.BackendAddressPools) {
+			foreach ($addr in $pool.LoadBalancerBackendAddresses) {
+				get-az_remote $addr.VirtualNetwork.Id
+			}
+		}
+	}
+
+	write-logFile "Reading VNETs (other RGs) referenced by Bastions..."
+	foreach ($bastion in $script:az_bastionHosts) { 
+		foreach ($conf in $bastion.IpConfigurations) {
+			get-az_remote $conf.Subnet.Id
+		}
+	}
+	
+	if ($copyDNS) {
+		write-logFile "Reading VNETs (other RGs) referenced by DNS Zones..."
+		foreach ($zone in $script:az_dnsZones) { 
+			foreach ($id in $zone.RegistrationVirtualNetworkIds) {
+				get-az_remote $id
+			}
+			foreach ($id in $zone.ResolutionVirtualNetworkIds) {
+				get-az_remote $id
+			}
+		}
+	}
+
+	write-logFile "Reading VNETs (other RGs) referenced by Private DNS Zones..."
+	foreach ($zone in $script:az_privateDnsZones) { 
+		get-az_remote $zone.VirtualNetworkId
+	}
+
+	write-logFile "Reading VNETs (other RGs) referenced by Private Endpoints..."
+	foreach ($ep in $script:az_privateEndpoints) { 
+		get-az_remote $ep.Subnet.Id
+	}
+
+	save-az_all ([ref] $script:az_virtualNetworks)
+}
+
+#--------------------------------------------------------------
+function get-az_natGateways {
+#--------------------------------------------------------------
+	write-logFile "Reading NAT Gateways (RG $sourceRG)..."
+
+	$script:az_natGateways = @( 
+		Get-AzNatGateway `
+			-ResourceGroupName $sourceRG `
+			-ErrorAction 'SilentlyContinue'
+	)
+	test-cmdlet 'Get-AzNatGateway'  "Could not get Gateways of resource group $sourceRG"
+
+	write-logFile "Reading NAT Gateways (other RGs) referenced by VNETs..."
+	foreach ($net in $script:az_virtualNetworks) {
+		foreach ($subnet in $net.subnets) {
+			get-az_remote $subnet.NatGateway.Id
+		}
+	}
+
+	save-az_all ([ref] $script:az_natGateways)
+}
+
+#--------------------------------------------------------------
+function get-az_routeTables {
+#--------------------------------------------------------------
+	write-logFile "Reading Route Tables (RG $sourceRG)..."
+
+	$script:az_routeTables = @( 
+		Get-AzRouteTable `
+			-ResourceGroupName $sourceRG `
+			-ErrorAction 'SilentlyContinue'
+	)
+	test-cmdlet 'Get-AzRouteTable'  "Could not get Route Tables of resource group $sourceRG"
+
+	write-logFile "Reading Route Tables (other RGs) referenced by VNETs..."
+	foreach ($net in $script:az_virtualNetworks) {
+		foreach ($subnet in $net.subnets) {
+			get-az_remote $subnet.RouteTable.Id
+		}
+	}
+
+	save-az_all ([ref] $script:az_routeTables)
+}
+
+#--------------------------------------------------------------
+function get-az_publicIPPrefixes{
+#--------------------------------------------------------------
+	write-logFile "Reading Public IP Prefixes (RG $sourceRG)..."
+
+	$script:az_publicIPPrefixes = @( 
+		Get-AzPublicIpPrefix `
+			-ResourceGroupName $sourceRG `
+			-ErrorAction 'SilentlyContinue'
+	)
+	test-cmdlet 'Get-AzPublicIpPrefix'  "Could not get Public IP Prefixes of resource group $sourceRG"
+
+	write-logFile "Reading Public IP Prefixes (other RGs) referenced by NAT Gateways..."
+	foreach ($gateway in $script:az_natGateways) { 
+		foreach ($prefix in $gateway.PublicIpPrefixes) {
+			get-az_remote $prefix.Id
+		}
+		foreach ($prefix in $gateway.PublicIpPrefixesV6) {
+			get-az_remote $prefix.Id
+		}
+	}
+
+	write-logFile "Reading Public IP Prefixes (other RGs) referenced by DNS entries..."
+	foreach ($rec in $script:az_dnsRecordSets) { 
+		get-az_remote $rec.TargetResourceId
+	}
+
+	write-logFile "Reading Public IP Prefixes (other RGs) referenced by Load Balancers..."
+	foreach ($lb in $script:az_loadBalancers) { 
+		foreach ($conf in $lb.FrontendIpConfigurations) {
+			get-az_remote  $conf.PublicIPPrefix.Id
+		}
+	}
+
+	write-logFile "Reading Public IP Prefixes (other RGs) referenced by Public IP Addresses..."
+	foreach ($ip in $script:az_publicIPAddresses) { 
+		get-az_remote $ip.PublicIpPrefix.Id
+	}
+
+	save-az_all ([ref] $script:az_publicIPPrefixes)
+}
+
+#--------------------------------------------------------------
+function get-az_publicIPAddresses {
+#--------------------------------------------------------------
+	write-logFile "Reading Public IPs (RG $sourceRG)..."
+
+	$script:az_publicIPAddresses = @( 
+		Get-AzPublicIPAddress `
+			-ResourceGroupName $sourceRG `
+			-ErrorAction 'SilentlyContinue'
+	)
+	test-cmdlet 'Get-AzPublicIPAddress'  "Could not get Public IP Addresses of resource group $sourceRG"
+
+	# get PublicIPs from other RGs
+	write-logFile "Reading Public IPs (other RGs) referenced by NICs..."
+	foreach ($nic in $script:az_networkInterfaces) { 
+		foreach ($conf in $nic.IpConfigurations) {
+			get-az_remote $conf.PublicIpAddress.Id
+		}
+	}
+
+	write-logFile "Reading Public IPs (other RGs) referenced by NAT Gateways..."
+	foreach ($gateway in $script:az_natGateways) { 
+		foreach ($ip in $gateway.PublicIpAddresses) {
+			get-az_remote $ip.Id
+		}
+		foreach ($ip in $gateway.PublicIpAddressesV6) {
+			get-az_remote $ip.Id
+		}
+	}
+
+	write-logFile "Reading Public IPs (other RGs) referenced by DNS entries..."
+	foreach ($rec in $script:az_dnsRecordSets) { 
+		get-az_remote $rec.TargetResourceId
+	}
+
+	write-logFile "Reading Public IPs (other RGs) referenced by Load Balancers..."
+	foreach ($lb in $script:az_loadBalancers) { 
+		foreach ($conf in $lb.FrontendIpConfigurations) {
+			get-az_remote $conf.PublicIpAddress.Id
+		}
+	}
+
+		write-logFile "Reading Public IPs (other RGs) referenced by Bastions..."
+	foreach ($bastion in $script:az_bastionHosts) { 
+		foreach ($conf in $bastion.IpConfigurations) {
+			get-az_remote $conf.PublicIpAddress.Id
+		}
+	}
+
+	save-az_all ([ref] $script:az_publicIPAddresses)
+}
+
+#--------------------------------------------------------------
+function get-az_networkSecurityGroups {
+#--------------------------------------------------------------
+	write-logFile "Reading NSGs (RG $sourceRG)..."
+
+	$script:az_networkSecurityGroups = @( 
+		Get-AzNetworkSecurityGroup `
+			-ResourceGroupName $sourceRG `
+			-ErrorAction 'SilentlyContinue'
+	)
+	test-cmdlet 'Get-AzNetworkSecurityGroup'  "Could not get NSGs of resource group $sourceRG"
+
+	# get NSGs from other RGs
+	write-logFile "Reading NSGs (other RGs) referenced by VNETs..."
+	foreach ($net in $script:az_virtualNetworks) {
+		foreach ($subnet in $net.subnets) {
+			get-az_remote $subnet.NetworkSecurityGroup.Id
+		}
+	}
+
+	write-logFile "Reading NSGs (other RGs) referenced by NICs..."
+	foreach ($nic in $script:az_networkInterfaces) {
+		get-az_remote $nic.NetworkSecurityGroup.Id
+	}
+
+	save-az_all ([ref] $script:az_networkSecurityGroups)
+}
+
+#--------------------------------------------------------------
+function get-az_applicationSecurityGroups {
+#--------------------------------------------------------------
+	write-logFile "Reading ASGs (RG $sourceRG)..."
+
+	$script:az_applicationSecurityGroups = @( 
+		Get-AzApplicationSecurityGroup `
+			-ResourceGroupName $sourceRG `
+			-ErrorAction 'SilentlyContinue'
+	)
+	test-cmdlet 'Get-AzApplicationSecurityGroup'  "Could not get ASGs of resource group $sourceRG"
+
+	# get ASGs from other RGs
+	write-logFile "Reading ASGs (other RGs) referenced by NSGs..."
+	foreach ($nsg in $script:az_networkSecurityGroups) {
+		foreach ($rule in $nsg.SecurityRules) {
+			foreach ($asg in $rule.SourceApplicationSecurityGroups) {
+				get-az_remote $asg.Id
+			}
+			foreach ($asg in $rule.DestinationApplicationSecurityGroups) {
+				get-az_remote $asg.Id
+			}
+		}
+	}
+
+	write-logFile "Reading ASGs (other RGs) referenced by NICs..."
+	foreach ($nic in $script:az_networkInterfaces) {
+		foreach ($conf in $nic.IpConfigurations) {
+			foreach ($asg in $conf.ApplicationSecurityGroups) {
+				get-az_remote $asg.Id
+			}
+		}
+	}
+
+	write-logFile "Reading ASGs (other RGs) referenced by PrivateEndpoints..."
+	foreach ($ep in $script:az_privateEndpoints) {
+		foreach ($asg in $ep.ApplicationSecurityGroups) {
+			get-az_remote $asg.Id
+		}
+	}
+
+	save-az_all ([ref] $script:az_applicationSecurityGroups)
+}
+
+#--------------------------------------------------------------
+function get-az_availabilitySets {
+#--------------------------------------------------------------
+	write-logFile "Reading Availability Sets (RG $sourceRG)..."
+
+	$script:az_availabilitySets = @( 
+		Get-AzAvailabilitySet `
+			-ResourceGroupName $sourceRG `
+			-ErrorAction 'SilentlyContinue'
+	)
+	test-cmdlet 'Get-AzAvailabilitySet'  "Could not get Availability Sets of resource group $sourceRG"
+
+	write-logFile "Reading Availability Sets (other RGs) referenced by VMs..."
+	foreach ($vm in $script:az_virtualMachines) { 
+		get-az_remote $vm.AvailabilitySetReference.Id
+	}
+
+	save-az_all ([ref] $script:az_availabilitySets)
+}
+
+#--------------------------------------------------------------
+function get-az_proximityPlacementGroups {
+#--------------------------------------------------------------
+	write-logFile "Reading PPGs (RG $sourceRG)..."
+
+	$script:az_proximityPlacementGroups = @( 
+		Get-AzProximityPlacementGroup `
+			-ResourceGroupName $sourceRG `
+			-ErrorAction 'SilentlyContinue'
+	)
+	test-cmdlet 'Get-AzProximityPlacementGroup'  "Could not get PPG of resource group $sourceRG"
+
+	write-logFile "Reading PPGs (other RGs) referenced by VMs..."
+	foreach ($vm in $script:az_virtualMachines) { 
+		get-az_remote $vm.ProximityPlacementGroup.Id
+	}
+
+	write-logFile "Reading PPGs (other RGs) referenced by Availability Sets..."
+	foreach ($avset in $script:az_availabilitySets) { 
+		get-az_remote $avset.ProximityPlacementGroup.Id
+	}
+
+	save-az_all ([ref] $script:az_proximityPlacementGroups)
+}
+
+#--------------------------------------------------------------
+function get-az_virtualMachineScaleSets {
+#--------------------------------------------------------------
+	write-logFile "Reading VMSS (RG $sourceRG)..."
+
+	$script:az_virtualMachineScaleSets = @( 
+		Get-AzVmss `
+			-ResourceGroupName $sourceRG `
+			-ErrorAction 'SilentlyContinue' `
+			-WarningAction 'SilentlyContinue'
+	)
+	test-cmdlet 'az_virtualMachineScaleSets'  "Could not get VMSS of resource group $sourceRG"
+
+	write-logFile "Reading VMSS (other RGs) referenced by VMs..."
+	foreach ($vm in $script:az_virtualMachines) { 
+		get-az_remote $vm.VirtualMachineScaleSet.Id
+	}
+
+	save-az_all ([ref] $script:az_virtualMachineScaleSets)
+}
+
+#--------------------------------------------------------------
+function get-az_storageAccounts {
+#--------------------------------------------------------------
+	$script:az_storageAccounts = @()
+	$script:az_storageAccountsFileService = @()
+	$script:az_storageAccountsBlobService = @()
+	$script:az_storageContainers = @()
+	$script:az_storageShares = @()
+
+	write-logFile "Reading Storage Accounts (RG $sourceRG)..."
+
+	$storageAccounts = Get-AzStorageAccount `
+						-ResourceGroupName $sourceRG `
+						-ErrorAction 'SilentlyContinue' `
+						-WarningAction 'SilentlyContinue'
+	test-cmdlet 'Get-AzStorageAccount'  "Could not get Storage Accounts of resource group $sourceRG"
+
+	foreach ($sa in $storageAccounts) {
+		$sa = convertFrom-json (convertTo-json $sa -Depth 5 -EnumsAsStrings -WarningAction 'SilentlyContinue') -AsHashtable
+		$sa.Context = $null
+		$script:az_storageAccounts += $sa
+	}
+
+	foreach ($az_res in $script:az_storageAccounts) {
+		$name = $az_res.StorageAccountName
+
+		#--------------------------------------------------------------
+		# get file storage properties
+		$fileServices = Get-AzStorageFileServiceProperty `
+							-ResourceGroupName $sourceRG `
+							-StorageAccountName $name `
+							-ErrorAction 'SilentlyContinue' `
+							-WarningAction 'SilentlyContinue'
+		if (!$?) {
+			if ($error[0].ToString() -notlike '*not supported for the account*') {
+				write-logFileWarning "Could not get File Service for storage account $name"
+			}
+		}
+
+		foreach ($fs in $fileServices) {
+			$script:az_storageAccountsFileService += $fs
+		}
+
+		#--------------------------------------------------------------
+		# get blob storage properties
+		$blobServices = Get-AzStorageBlobServiceProperty `
+							-ResourceGroupName $sourceRG `
+							-StorageAccountName $name `
+							-ErrorAction 'SilentlyContinue' `
+							-WarningAction 'SilentlyContinue'
+		if (!$?) {
+			if ($error[0].ToString() -notlike '*not supported for the account*') {
+				# write-logFile "Could not get Blob Service for storage account $name" -ForegroundColor 'DarkGray'
+			}
+		}
+
+		foreach ($bs in $blobServices) {
+			$script:az_storageAccountsBlobService += $bs
+		}
+	}
+
+	#--------------------------------------------------------------
+	# get storage account container 
+	# write-logFile "Reading Storage Account Containers (RG $sourceRG)..."
+	foreach ($az_res in $script:az_storageAccountsBlobService) {
+
+		$containers = Get-AzRmStorageContainer `
+						-ResourceGroupName $sourceRG `
+						-StorageAccountName $az_res.StorageAccountName `
+						-ErrorAction 'SilentlyContinue' `
+						-WarningAction 'SilentlyContinue'
+		test-cmdlet 'Get-AzRmStorageContainer'  "Could not get containers of storage account $name"
+
+		foreach ($container in $containers) {
+			$script:az_storageContainers += $container
+		}
+	}
+
+	#--------------------------------------------------------------
+	# get storage account shares
+	# write-logFile "Reading Storage Account Shares (RG $sourceRG)..."
+	foreach ($az_res in $script:az_storageAccountsFileService) {
+
+		$shares = Get-AzRmStorageShare `
+					-ResourceGroupName $sourceRG `
+					-StorageAccountName $az_res.StorageAccountName `
+					-ErrorAction 'SilentlyContinue' `
+					-WarningAction 'SilentlyContinue'
+		test-cmdlet 'Get-AzRmStorageShare'  "Could not get shares of storage account $name"
+
+		foreach ($share in $shares) {
+			$script:az_storageShares += $share
+		}
+	}
+
+	save-az_all ([ref] $script:az_storageAccounts)
+	save-az_all ([ref] $script:az_storageAccountsFileService) -noCount
+	save-az_all ([ref] $script:az_storageAccountsBlobService) -noCount
+	save-az_all ([ref] $script:az_storageContainers) -noCount
+	save-az_all ([ref] $script:az_storageShares) -noCount
+}
+
+#--------------------------------------------------------------
+function get-az_privateEndpoints {
+#--------------------------------------------------------------
+	write-logFile "Reading Private Endpoints (RG $sourceRG)..."
+
+	$script:az_privateEndpoints = @( 
+		Get-AzPrivateEndpoint `
+			-ResourceGroupName $sourceRG `
+			-ErrorAction 'SilentlyContinue'
+	)
+	test-cmdlet 'Get-AzPrivateEndpoint'  "Could not get Private Endpoints of resource group '$sourceRG'"
+
+	
+	$script:az_privateDnsZoneGroups = @()
+	foreach ($ep in $script:az_privateEndpoints) {
+
+		$script:az_privateDnsZoneGroups += @(
+			Get-AzPrivateDnsZoneGroup `
+				-ResourceGroupName $sourceRG `
+				-PrivateEndpointName $ep.Name `
+				-ErrorAction 'SilentlyContinue'
+		)
+		test-cmdlet 'Get-AzPrivateDnsZoneGroup'  "Could not get DNS zones of Private Endpoint '$($ep.Name)'"
+	}
+
+	save-az_all ([ref] $script:az_privateEndpoints)
+	save-az_all ([ref] $script:az_privateDnsZoneGroups) -noCount
+}
+
+#--------------------------------------------------------------
+function remove-angleBrackets {
 #--------------------------------------------------------------
 	param (
-		$bicepName
+		$string
 	)
 
-	if ($Null -eq $script:bicepNamesAll[$bicepName]) {
-		return $Null, $Null
+	if ($string -like '<*>') {
+		$string = $string	-replace '<', '' `
+							-replace '>', ''
 	}
-	else {
-		return $script:bicepNamesAll[$bicepName].name, $script:bicepNamesAll[$bicepName].type
-	}
+
+	return $string
 }
 
+#--------------------------------------------------------------
+# replace type text (simplify BICEP names)
+$script:shortTypeName = @{}
+$script:shortTypeName['virtualMachines'] = 'vm'
+$script:shortTypeName['extensions'] = 'vmext'
+$script:shortTypeName['disks'] = 'disk'
+$script:shortTypeName['virtualNetworks'] = 'nw'
+$script:shortTypeName['networkSecurityGroups'] = 'nsg'
+$script:shortTypeName['applicationSecurityGroups'] = 'asg'
+$script:shortTypeName['networkInterfaces'] = 'nic'
+$script:shortTypeName['publicIPAddresses'] = 'ipaddr'
+$script:shortTypeName['publicIPPrefixes'] = 'ipprefix'
+$script:shortTypeName['loadBalancers'] = 'lb'
+$script:shortTypeName['natGateways'] = 'gw'
+$script:shortTypeName['dnsZones'] = 'dns'
+$script:shortTypeName['privateDnsZones'] = 'privdns'
+$script:shortTypeName['virtualNetworkLinks'] = 'dnslink'
+$script:shortTypeName['availabilitySets'] = 'avset'
+$script:shortTypeName['proximityPlacementGroups'] = 'ppg'
+$script:shortTypeName['virtualMachineScaleSets'] = 'vmss'
+$script:shortTypeName['bastionHosts'] = 'bastion'
+$script:shortTypeName['storageAccounts'] = 'sa'
+$script:shortTypeName['fileServices'] = 'file'
+$script:shortTypeName['blobServices'] = 'blob'
+$script:shortTypeName['netAppAccounts'] = 'netapp'
+$script:shortTypeName['capacityPools'] = 'pool'
+$script:shortTypeName['volumes'] = 'volume'
+$script:shortTypeName['routeTables'] = 'route'
 #--------------------------------------------------------------
 function get-bicepNameByType {
 #--------------------------------------------------------------
+	# get and create unique BICEP name
+	# from full qualified resource type and name
 	param (
-		$type,	# multi-part type
-		$name	# multi-part name
+		$type,	# multi-part type, e.g. 'Microsoft.Storage/storageAccounts/blobServices'
+		$name	# multi-part name. e.g. 'saName/srvName'
 	)
 
 	# single-part type and name
@@ -18539,28 +19087,63 @@ function get-bicepNameByType {
 							"name = $name"
 	}
 
-	$typeShort = $typeParts[-1]
-	$nameShort = $nameParts[-1]
+	# maximum length of bicep name: 128
+	# -> 30 chars for each: type, partname1, partname2, partname3
 
-	# ToLower(): woraround for Azure bug:
-	# resource ID contained resource name in wrong case (upper case instead of lower case)
-	$bicepName = ("$typeShort`_$nameShort" -replace '[\W]', '_').ToLower()
-	$count = 1
-
-	# check if name is already in use
-	$nameSaved, $typeSaved = get-NameByBicepName $bicepName
-	while (($Null -ne $nameSaved) -and (($name -ne $nameSaved) -or ($type -ne $typeSaved))) {
-		$count++
-		$bicepName = ("$typeShort$count`_$nameShort" -replace '[\W]', '_').ToLower()
-		$nameSaved, $typeSaved = get-NameByBicepName $bicepName
+	# clean part names
+	for ($i = 0; $i -lt $nameParts.Count; $i++) {
+		# remove: . - _
+		# replace all special characters with _
+		$nameParts[$i] = $nameParts[$i]  `
+							-replace '\.', '' `
+							-replace '-', '' `
+							-replace '_', '' `
+							-replace '[\W]', '_'
+		# maximum length: 30 characters
+		if ($nameParts[$i].Length -gt 30) {
+			$nameParts[$i] = $nameParts[$i].Substring(0,30)
+		}
 	}
+	$nameLong = $nameParts -join '_'
 
+	# clean type name
+	# only use sub-type
+	$typeShort = $typeParts[-1]
+	# shorten sub-type by given replacements
+	if ($null -ne $script:shortTypeName[$typeShort]) {
+		$typeShort = $script:shortTypeName[$typeShort]
+	}
+	# maximum length: 30 characters
+	if ($typeShort.Length -gt 30) {
+		$typeShort = $typeShort.Substring(0,30)
+	}
+	
+	# make bicep name unique:
+	# check if SAME BICEP name is already in use for DIFFERENT Azure name or type
+	$count = $null
+	do {
+		$bicepName = "$typeShort$count`_$nameLong".ToLower()
+		# ToLower(): woraround for Azure bug:
+		# resource ID contained resource name in wrong case (upper case instead of lower case)
+		$nameSaved = $script:bicepNamesAll[$bicepName].name
+		$typeSaved = $script:bicepNamesAll[$bicepName].type
+
+		if ($null -eq $count) {
+			$count = 1
+		}
+		$count++	
+	} until (
+		($Null -eq $nameSaved) -or (($name -eq $nameSaved) -and ($type -eq $typeSaved))
+	)
+
+	# BICEP name is created at first usage 
+	# (either during resource creation or when referenced by other resource)
 	if ($Null -eq $nameSaved) {
 		# save unique bicep name
 		$script:bicepNamesAll[$bicepName] = @{
-			bicepName	= $bicepName
-			type		= $type
-			name		= $name
+			bicepName	= $bicepName # calculated above
+			type		= $type # multi-part type
+			name		= $name # multi-part name
 		} 
 	}
 
@@ -18570,108 +19153,120 @@ function get-bicepNameByType {
 #--------------------------------------------------------------
 function get-bicepNameById {
 #--------------------------------------------------------------
+	# get and create unique BICEP name
+	# from given resource ID
+	# When $useMainResource is set, the sub-resorce part if the ID is ignored
 	param (
-		$id
+		$id, # id of main-resource or sub-resource
+		[switch] $useMainResource
 	)
 
+	# no reference to resource => nothing to add in BICEP template
 	if ($Null -eq $id) {
 		return $Null
 	}
 
+	# parase $id
 	$r = get-resourceComponents $id
+
+	# main-resource
 	$type = $r.resourceArea + '/' + $r.mainResourceType 
 	$name = $r.mainResourceName
 
-	# always get the name of the MAIN resource !!!
+	# sub-resource
+	if ($null -ne $r.subResourceType) {
+		if (!$useMainResource) {
+			$type += "/$($r.subResourceType)"
+			$name += "/$($r.subResourceName)"
+		}
+	}
+
 	return (get-bicepNameByType $type $name)
 }
 
 #--------------------------------------------------------------
-function get-bicepIdStructByType {
+function get-bicepReference {
 #--------------------------------------------------------------
-	param (
-		$type,
-		$name
-	)
+	<#
+		input: referenced resource ID
+		output: struct { id = ...}
 
-	$bicepName = get-bicepNameByType $type $name
-	if ($Null -eq $bicepName) {
-		return $Null
-	}
-	else {
-		return @{
-			id = "<$bicepName`.id>"
-		}
-	}
-}
-	
+		Normal resources in the target RG:
+				struct { id = bicepname.id }
+		Sub-resources in the target RG:
+				struct { id = resourceId( ... ) }
+				in addition, main-resource is added to $dependsOn
+		in cloneOrMergeMode:
+				struct { id = '/subscriptions/../..'}
+	#>
 
-#--------------------------------------------------------------
-function get-bicepIdStructById {
-#--------------------------------------------------------------
 	param (
 		$id,
-		[switch] $forceBicep
+		[ref] $depensOn,
+		[switch] $allowSubresource
 	)
 
-	if ($Null -eq $id) {
+	# referenced resource ID is Null
+	if ($null -eq $id) {
 		return $Null
 	}
 
-	if (($cloneOrMergeMode) -and (!$forceBicep)) {
-		return (get-bicepResourceFunctionById $id)
+	# get main resource BICEP name
+	# This always works because a name is generated even if resource is not found
+	$bicepNameMain = get-bicepNameById $id -useMainResource
+	$bicepName     = get-bicepNameById $id
+	$r = get-resourceComponents $id
+
+	if ($cloneOrMergeMode) {
+		$rg = "'$($r.resourceGroup)', "
 	}
 	else {
-		# always get the name of the MAIN resource !!!
-		$bicepName = get-bicepNameById $id
-		return @{
-			id = "<$bicepName`.id>"
-		}
-	}
-}
-
-#--------------------------------------------------------------
-function get-bicepResourceFunctionById {
-#--------------------------------------------------------------
-	param (
-		$id,
-		[ref] $depensOn
-	)
-
-	$bicepName = get-bicepNameById $id
-	if ($Null -eq $bicepName) {
-		return $Null
+		$rg = $Null
 	}
 
-	else {
-		# for a sub resoure, the main resource is added to the dependency list
-		if ($Null -ne $depensOn) {
-			$depensOn.Value += "<$bicepName>"
-		}
+	$bicepIdMain	= "<resourceId($rg'$($r.resourceArea)/$($r.mainResourceType)', '$($r.mainResourceName)')>"
+	$bicepId		= "<resourceId($rg'$($r.resourceArea)/$($r.mainResourceType)/$($r.subResourceType)', '$($r.mainResourceName)', '$($r.subResourceName)')>"
 
-		$r = get-resourceComponents $id
+	#--------------------------------------------------------------
+	# main-resource
+	if ($bicepName -eq $bicepNameMain) {
 
-		# add resource group name
+		# clone or merge mode:
+		# referenced resource might not be contained in BICEP template, but it already exists
 		if ($cloneOrMergeMode) {
-			$rg = "'$($r.resourceGroup)', "
-		}
-		else {
-			$rg = $Null
-		}
-
-		# ID of main resource was passed as parameter
-		if ($Null -eq $r.subResourceType) {
-			$string = "<resourceId($rg'$($r.resourceArea)/$($r.mainResourceType)', '$($r.mainResourceName)')>"
-
+			return @{
+				id = $bicepIdMain
+			}
 		}
 
-		# ID of sub resource was passed as parameter: This is the typical case
-		else {
-			$string = "<resourceId($rg'$($r.resourceArea)/$($r.mainResourceType)/$($r.subResourceType)', '$($r.mainResourceName)', '$($r.subResourceName)')>"
-		}
-
+		# copy mode
 		return @{
-			id = $string
+			id = "<$bicepNameMain`.id>"
+		}
+	}
+
+	#--------------------------------------------------------------
+	# # reference to a sub-resource, e.g. subnet
+	if ($allowSubresource) {
+		# return sub-resource ID
+		# this is only allowed if sub-resource has been defined separately from main-resource
+		return @{
+			id = "<$bicepName`.id>"
+		}
+	}
+
+	else {
+		if ($Null -ne $depensOn) {
+			# set dependency to main-resource, e.g. vnet
+			$depensOn.Value += "<$bicepNameMain>"
+
+			# dependency is not needed if sub-resource is referenced from main-resource
+			# e.g. backend address pool referenced from load balancer
+		}
+		
+		# return sub-resource using function resourceId()
+		return @{
+			id = $bicepId
 		}
 	}
 }
@@ -18857,7 +19452,7 @@ function add-bicepResource {
 
 							# string that does not need quotes (e.g. parameter name)
 							if ($item -like '<*>') {
-								$item = test-angleBrackets $item
+								$item = remove-angleBrackets $item
 								$textArray += $tabString * ($tabCount + 1) + "$item"
 							}
 							
@@ -18906,7 +19501,7 @@ function add-bicepResource {
 				# except for tags values ($script:isKeyOfATag -eq $True)
 				if ($value -like '<*>') {
 					if (!$script:isKeyOfATag -or ($key -eq "'TipNode.SessionId'")) {
-						$value = test-angleBrackets $value
+						$value = remove-angleBrackets $value
 						$textArray += $tabString * $tabCount + "$key`: $value"
 					}
 				}
@@ -18951,10 +19546,12 @@ function add-resourcesALL {
 #--------------------------------------------------------------
 	param (
 		$resource,
-		$azres,
+		$az_res,
 		$resName,
-		$bicepName,
-		[switch] $noRegion
+		$bicepResName,
+		[switch] $noRegion,
+		[switch] $regionGlobal,
+		[switch] $noZones
 	)
 
 	if (!$useBicep) {
@@ -18962,22 +19559,23 @@ function add-resourcesALL {
 		return
 	}
 
+	#--------------------------------------------------------------
 	# resource read by cmdlet (two parameters provided)
-	if ($Null -ne $azres) {
-		if ($Null -eq $resName) {
-			$resource.name 			= $az_res.Name
-		}
-		else {
+	if ($Null -ne $az_res) {
+		$resource.name 				= $az_res.Name
+		$resource.resourceGroupName	= $az_res.ResourceGroupName
+
+		# overwrite resource name
+		if ($Null -ne $resName) {
 			$resource.name 			= $resName
 		}
-		$resource.resourceGroupName	= $az_res.ResourceGroupName
 
 		# tags for most resources
 		$tags = $az_res.Tags -as [hashtable]
 		if ($tags.count -gt 0) {
 			$resource.tags = $tags
 		}
-		# tags for some resources
+		# tags for some resources ('Tag' rather than 'Tags')
 		else {
 			$tags = $az_res.Tag -as [hashtable]
 			if ($tags.count -gt 0) {
@@ -18988,27 +19586,278 @@ function add-resourcesALL {
 		# zones
 		$zones = $az_res.Zones -as [array]
 		if ($zones.count -gt 0) {
-			$resource.zones = $zones
+			if ($noZones) {
+				# warning when Zones was set, but ignored by RGCOPY
+				test-property 'zones' $az_res.Zones
+			}
+			else {
+				$resource.zones = $zones
+			}
 		}
+
+		# warning when extendedLocation or placement was set
+		test-property 'extendedLocation' $az_res.ExtendedLocation
+		test-property 'placement' $az_res.Placement
 	}
 
+	#--------------------------------------------------------------
 	# resource manually added
 	else {
 		$resource.resourceGroupName = $sourceRG
 	}
+	#--------------------------------------------------------------
 
-	if (!$noRegion) {
+	# set region
+	if (($az_res.Location -eq 'global') -or $regionGlobal) {
+		$resource.location = 'global'
+	}
+
+	elseif (!$noRegion) {
 		$resource.location = '<regionName>'
 	}
 
-	if ($Null -eq $bicepName) {
-		$bicepName = get-bicepNameByType $resource.type $resource.name
+	# add BICEP name
+	if ($Null -eq $bicepResName) {
+		$resource.bicepName = get-bicepNameByType $resource.type $resource.name
+	}
+	else {
+		$resource.bicepName = get-bicepNameByType $resource.type $bicepResName
+	}
+	
+	# save resource
+	$script:resourcesALL += $resource
+	$script:lastBicepName = $resource.bicepName
+}
+
+#--------------------------------------------------------------
+function test-az_local {
+#--------------------------------------------------------------
+	param (
+		$id
+	)
+
+	# nothing to do
+	if ($Null -eq $id) {
+		return
 	}
 
-	$resource.bicepName = $bicepName
+	# parse Id
+	$r = get-resourceComponents $id
+	$subscriptionID 	= $r.subscriptionID
+	$type				= $r.mainResourceType
+	$name				= $r.mainResourceName
+	$resourceGroupName	= $r.resourceGroup
 
-	# add resource
-	$script:resourcesALL += $resource
+	# different subscription
+	if ($subscriptionID -ne $sourceSubID) {
+		write-logFileError "Resource '$name' of type '$type' is in wrong subscription" `
+							"Subscription ID is: $subscriptionID" `
+							"Subscription ID should be: $sourceSubID"
+	}
+
+	# different resource group
+	if ($resourceGroupName -ne $sourceRG) {
+		write-logFileError "Resource '$name' of type '$type' is in wrong resource group" `
+							"Resource group is: $resourceGroupName" `
+							"Resource group should be: $sourceRG"
+	}
+}
+
+#--------------------------------------------------------------
+function split-az_singleMulti {
+#--------------------------------------------------------------
+	param (
+		$list	# IList<String>
+	)
+
+	$single = $null
+	$multi = @()
+
+	if ($list.Count -eq 1) {
+		$single = $list[0]	
+	}
+
+	if ($list.Count -gt 1) {
+		$multi = $list -as [array]
+	}
+
+	return @{
+		single = $single	# [string]
+		multi  = $multi		# [array]
+	}
+}
+
+#--------------------------------------------------------------
+function get-az_ipTags {
+#--------------------------------------------------------------
+	param (
+		$azTags
+	)
+
+	$ipTags = @()
+	if ($ipTagEnabled) {
+		if ($setIpTag.length -ne 0) {
+			# create new IP tag
+			$ipTags = @(
+				@{
+					ipTagType	= $setIpTagType
+					tag			= $setIpTag
+				}
+			)
+		}
+		elseif ('setIpTag' -notin $boundParameterNames) {
+			# copy existing IP tags
+			foreach ($tag in $azTags) {
+				if ($tag.Tag.Length -ne 0) {
+					$ipTags += @{
+						ipTagType	= $tag.IpTagType
+						tag			= $tag.Tag
+					}
+				}
+			}
+		}
+	}
+
+	return ,$ipTags		# return [array] (forced by comma)
+}
+
+#--------------------------------------------------------------
+function get-supportedZones {
+#--------------------------------------------------------------
+	param (
+		$resType,
+		$resName,
+		$azZones
+	)
+
+	if ($azZones.Count -eq 0) {
+		return $null
+	}
+
+	$showWarning = $false
+
+	if ($azZones.Count -ne $script:allTargetZones.Count) {
+		$showWarning = $true
+	}
+
+	foreach ($zone in $azZones) {
+		if ($zone -notin $script:allTargetZones) {
+			$showWarning = $true
+		}
+	}
+
+	if ($showWarning) {
+		write-logFileWarning "Property 'zones' set in source RG but skipped by RGCOPY" `
+							"Resoure: '$resType/$resName', zones: $($azZones -as [string])"`
+	}
+
+	return ,$script:allTargetZones 	# comma: do not convert [array] with 0 or 1 elements to scalar
+}
+
+#--------------------------------------------------------------
+function test-property {
+#--------------------------------------------------------------
+	param (
+		$property,
+		$value,
+		[switch] $unknownProperty,	# property not found in Get-AzXXX
+		[switch] $displayProperty,	# property is not needed for deployment (e.g. current state)
+		[switch] $uselessProperty	# property does not fit for RGCOPY (e.g. VM image)
+	)
+
+	# property not found in az-cmdlet: value is unknown
+	# Therefore, it cannot be set by RGCOPY
+	if ($unknownProperty) {
+		# write-logFileWarning "Property '$property' of resoure: '$resType/$resName' unknown"
+		return
+	}
+	
+	# property is a display only property
+	# value is known, but will not be used by RGCOPY
+	if ($displayProperty -or $unneededProperty) {
+		return
+	}
+
+	# value was not set
+	if ($value.Count -eq 0) {
+		return
+	}
+
+	# value set, but ignored by RGCOPY
+	write-logFileUpdates $script:testResourceType $script:testResourceName -warning "property '$property' skipped by RGCOPY"
+}
+
+#--------------------------------------------------------------
+function get-identity {
+#--------------------------------------------------------------
+	param (
+		$az_res
+	)
+
+	if (!$patchMode) {
+		return $null
+	}
+
+	# get resource type and name
+	$r = get-resourceComponents $az_res.Id
+	$resName = $r.mainResourceName
+	$resType = $r.mainResourceType
+
+	$identity = @{
+		type = 'None'
+		userAssignedIdentities = @{}
+	}
+
+	# always keep system assigned identity
+
+	# check user assigned identies
+	if ($az_res.Identity.Type -like '*UserAssigned*') {
+
+		# check each identity seperately
+		foreach ($id in $az_res.Identity.UserAssignedIdentities.Keys) {
+			$name = ($id -split '/')[8]
+
+			# remove identities when parameter skipIdentities is set
+			if ($skipIdentities) {
+				write-logFileUpdates $resName $resType "delete identity" "$name (skipIdentities)"
+			}
+
+			# remove identities from different tenants
+			elseif ($sourceSubTenant -ne $targetSubTenant) {
+				write-logFileUpdates $resName $resType "delete identity" "$name (different tenant)"
+			}
+
+			# remove azSecPack identity (will be re-created automatically)
+			elseif (($name -like '*AzSecPackAutoConfigUA-*') -and !$keepIdentities) {
+				# write-logFileUpdates $resName $resType "delete identity" "$name (AzSecPack)"
+			}
+
+			# keep identity
+			else {
+				# set identity: value is an empty hash table by definition!
+				$identity.userAssignedIdentities.$id = @{}
+			}
+		}
+	}
+
+	# calculate type
+	if ($identity.userAssignedIdentities.Count -gt 0) {
+		if ($az_res.Identity.Type -like '*SystemAssigned*') {
+			$identity.type = 'SystemAssigned,UserAssigned'
+		}
+		else {
+			$identity.type = 'UserAssigned'
+		}
+	}
+	elseif ($az_res.Identity.Type -like '*SystemAssigned*') {
+		$identity.type = 'SystemAssigned'
+	}
+	else {
+		$identity.type = 'None'
+	}
+
+	# return hash table
+	return $identity
 }
 
 #--------------------------------------------------------------
@@ -19016,6 +19865,10 @@ function add-az_virtualMachines {
 #--------------------------------------------------------------
 	foreach ($az_res in $script:az_virtualMachines) {
 
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'vm'
+		#========================================
 		$dependsOn = @()
 
 		#--------------------------------------------------------------
@@ -19025,11 +19878,11 @@ function add-az_virtualMachines {
 
 		$osDisk				= @{
 			name					= $disk.Name
-			osType					= $disk.OsType -as [string]
-			caching					= $disk.Caching -as [string]
+			osType					= convertTo-String $disk.OsType
+			caching					= convertTo-String $disk.Caching
 			writeAcceleratorEnabled	= convertTo-Boolean $disk.WriteAcceleratorEnabled
 			createOption			= 'Attach'
-			deleteOption			= $disk.DeleteOption -as [string]
+			deleteOption			= convertTo-String $disk.DeleteOption
 			managedDisk				= @{
 				id = "<$bicepName`.id>"
 			}
@@ -19047,10 +19900,10 @@ function add-az_virtualMachines {
 
 			$dataDisks += @{
 				name					= $disk.Name
-				caching					= $disk.Caching -as [string]
+				caching					= convertTo-String $disk.Caching
 				writeAcceleratorEnabled	= convertTo-Boolean $disk.WriteAcceleratorEnabled
 				createOption			= 'Attach'
-				deleteOption			= $disk.DeleteOption -as [string]
+				deleteOption			= convertTo-String $disk.DeleteOption
 				lun						= $disk.Lun
 				managedDisk				= @{
 					id = "<$bicepName`.id>"
@@ -19067,26 +19920,27 @@ function add-az_virtualMachines {
 		#--------------------------------------------------------------
 		# storageProfile
 		$storageProfile = @{
-			osDisk				= $osDisk
+			# alignRegionalDisksToVMZone
 			dataDisks			= $dataDisks
+			diskControllerType	= convertTo-String $az_res.StorageProfile.DiskControllerType
+			# imageReference
+			osDisk				= $osDisk
 		}
+		test-property 'storageProfile.alignRegionalDisksToVMZone' $az_res.StorageProfile.AlignRegionalDisksToVMZone
+		test-property 'storageProfile.imageReference' $az_res.StorageProfile.ImageReference
 
-		$diskControllerType = $az_res.StorageProfile.DiskControllerType -as [string]
-		if ($diskControllerType -eq 'NVMe') {
-			$storageProfile.diskControllerType = $diskControllerType
-		}
 
 		#--------------------------------------------------------------
 		# NetworkInterfaces
 		$networkInterfaces = @()
 		foreach ($nic in $az_res.NetworkProfile.NetworkInterfaces) {
-			$bicepName = get-bicepNameById $nic.Id
+
 			$networkInterfaces += @{
 				properties = @{
-					deleteOption	= $nic.DeleteOption -as [string]
+					deleteOption	= convertTo-String $nic.DeleteOption
 					primary			= convertTo-Boolean $nic.Primary
 				}
-				id = "<$bicepName`.id>"
+				id = "<$(get-bicepNameById $nic.Id).id>"
 			}
 		}
 
@@ -19097,160 +19951,101 @@ function add-az_virtualMachines {
 		}
 		else {
 			$additionalCapabilities = @{
-				hibernationEnabled	= convertTo-Boolean $az_res.AdditionalCapabilities.HibernationEnabled
-				ultraSSDEnabled		= convertTo-Boolean $az_res.AdditionalCapabilities.UltraSSDEnabled
+				hibernationEnabled			= convertTo-Boolean $az_res.AdditionalCapabilities.HibernationEnabled
+				ultraSSDEnabled				= convertTo-Boolean $az_res.AdditionalCapabilities.UltraSSDEnabled
+				enableFips1403Encryption	= convertTo-Boolean $az_res.AdditionalCapabilities.EnableFips1403Encryption
 			}
 		}
-
 
 		#--------------------------------------------------------------
-		# securityProfile
-		if ($Null -eq $az_res.SecurityProfile) {
-			$securityProfile = $Null
-		}
-		else {
-			if ($Null -eq $az_res.SecurityProfile.UefiSettings) {
-				$uefiSettings = $Null
-			}
-			else {
-				$uefiSettings = @{
-					secureBootEnabled 	= convertTo-Boolean $az_res.SecurityProfile.UefiSettings.SecureBootEnabled
-					vTpmEnabled			= convertTo-Boolean $az_res.SecurityProfile.UefiSettings.VTpmEnabled
-				}
-			}
-
-			$securityProfile = @{
-				encryptionAtHost	= convertTo-Boolean $az_res.SecurityProfile.EncryptionAtHost
-				securityType		= $az_res.SecurityProfile.SecurityType -as [string]
-				uefiSettings		= $uefiSettings
+		$securityProfile = @{
+			encryptionAtHost	= convertTo-Boolean $az_res.SecurityProfile.EncryptionAtHost
+			# encryptionIdentity
+			# proxyAgentSettings
+			securityType		= convertTo-String $az_res.SecurityProfile.SecurityType
+			uefiSettings		= @{
+				secureBootEnabled 	= convertTo-Boolean $az_res.SecurityProfile.UefiSettings.SecureBootEnabled
+				vTpmEnabled			= convertTo-Boolean $az_res.SecurityProfile.UefiSettings.VTpmEnabled
 			}
 		}
+		test-property 'securityProfile.encryptionIdentity' $az_res.SecurityProfile.EncryptionIdentity
+		test-property 'securityProfile.proxyAgentSettings' $az_res.SecurityProfile.ProxyAgentSettings
 
 		#--------------------------------------------------------------
 		# properties
 		$properties = @{
 			additionalCapabilities	= $additionalCapabilities
 			# applicationProfile
-			availabilitySet			= get-bicepIdStructById $az_res.AvailabilitySetReference.Id
+			availabilitySet			= get-bicepReference $az_res.AvailabilitySetReference.Id
 			# billingProfile
 			# capacityReservation
 			diagnosticsProfile = @{
 				bootDiagnostics 	= @{
 					enabled			= convertTo-Boolean $az_res.DiagnosticsProfile.BootDiagnostics.Enabled
-					storageUri		= $az_res.DiagnosticsProfile.BootDiagnostics.StorageUri -as [string]
+					storageUri		= convertTo-String $az_res.DiagnosticsProfile.BootDiagnostics.StorageUri
 				}
 			}
-			evictionPolicy			= $az_res.EvictionPolicy
+			evictionPolicy			= convertTo-String $az_res.EvictionPolicy
 			# extensionsTimeBudget
 			hardwareProfile = @{
-				vmSize = $az_res.HardwareProfile.VmSize -as [string]
-				# vmSizeProperties (in preview)
+				vmSize 				= convertTo-String $az_res.HardwareProfile.VmSize
+				# vmSizeProperties	# still in preview
 			}
 			# host
 			# hostGroup
-			licenseType				= $az_res.LicenseType
+			licenseType				= convertTo-String $az_res.LicenseType
 			networkProfile = @{
 				# networkApiVersion
 				# networkInterfaceConfigurations
 				networkInterfaces	= $networkInterfaces
 			}
-			# osProfile
-			platformFaultDomain 	= $az_res.PlatformFaultDomain
-			priority				= $az_res.Priority
-			proximityPlacementGroup	= get-bicepIdStructById $az_res.ProximityPlacementGroup.Id
+			# osProfile				# not used when using OS disk snapshot
+			platformFaultDomain 	= $az_res.PlatformFaultDomain # [int]
+			priority				= convertTo-String $az_res.Priority
+			proximityPlacementGroup	= get-bicepReference $az_res.ProximityPlacementGroup.Id
+			# scheduledEventsPolicy
 			# scheduledEventsProfile
 			securityProfile 		= $securityProfile
 			storageProfile 			= $storageProfile
-			userData				= $az_res.UserData
-			virtualMachineScaleSet	= get-bicepIdStructById $az_res.VirtualMachineScaleSet.Id
+			userData				= convertTo-String $az_res.UserData
+			virtualMachineScaleSet	= get-bicepReference $az_res.VirtualMachineScaleSet.Id
 		}
+		test-property -uselessProperty 'applicationProfile' $az_res.ApplicationProfile
+		test-property 'billingProfile' $az_res.BillingProfile
+		test-property 'capacityReservation' $az_res.CapacityReservation
+		test-property -unknownProperty 'extensionsTimeBudget'
+		test-property -uselessProperty 'hardwareProfile.vmSizeProperties' $az_res.HardwareProfile.VmSizeProperties
+		test-property 'host' $az_res.Host
+		test-property 'hostGroup' $az_res.HostGroup
+		test-property 'networkProfile.networkApiVersion' $az_res.NetworkProfile.NetworkApiVersion
+		test-property 'networkProfile.networkInterfaceConfigurations' $az_res.NetworkProfile.NetworkInterfaceConfigurations
+		test-property 'osProfile' $az_res.OSProfile
+		test-property -unknownProperty 'scheduledEventsPolicy'
+		test-property -unknownProperty 'scheduledEventsProfile'
 
 		#--------------------------------------------------------------
-		# identities
-		$identity = @{
-			type = 'None'
-			userAssignedIdentities = @{}
-		}
-
-		if (!$patchMode) {
-			if ($az_res.Identity.count -ne 0) {
-
-				# check system assigned identity
-				if ($az_res.Identity.Type -like '*SystemAssigned*') {
-					if ($skipIdentities) {
-						write-logFileUpdates 'virtualMachines' $az_res.Name 'delete system assigned Identity' "(skipIdentities)"
-					}
-					else {
-						write-logFileUpdates 'virtualMachines' $az_res.Name 'keep system assigned Identity'
-						$identity.type = 'SystemAssigned'
-					}
-				}
-
-				# check user assigned identies
-				if ($az_res.Identity.Type -like '*UserAssigned*') {
-
-					# check each identity seperately
-					foreach ($id in $az_res.Identity.UserAssignedIdentities.Keys) {
-						$name = ($id -split '/')[8]
-
-						# skip all identities
-						if ($skipIdentities) {
-							write-logFileUpdates 'virtualMachines' $az_res.Name "delete identity" "$name (skipIdentities)"
-						}
-
-						# remove azSecPack identity (will be re-created automatically)
-						elseif (($name -like '*AzSecPackAutoConfigUA-*') -and !$keepIdentities) {
-							write-logFileUpdates 'virtualMachines' $az_res.Name "delete identity" "$name (AzSecPack)"
-						}
-
-						# remove identities from different tenants
-						elseif ($sourceSubTenant -ne $targetSubTenant) {
-							write-logFileUpdates 'virtualMachines' $az_res.Name "delete identity" "$name (different tenant)"
-						}
-
-						# keep identity
-						else {
-							write-logFileUpdates 'virtualMachines' $az_res.Name "keep identity" $name
-							# set identity: value is an empty hash table by definition!
-							$identity.userAssignedIdentities.$id = @{}
-							$count += 1
-
-							if ($identity.type -like '*SystemAssigned*') {
-								$identity.type = 'SystemAssigned, UserAssigned'
-							}
-							else {
-								$identity.type = 'UserAssigned'
-							}
-						}
-					}
-				}
-			}
-		}
-
 		# create resource
 		$resource = @{
-			type 				= 'Microsoft.Compute/virtualMachines'
-			apiVersion			= '2022-11-01'
-			properties			= $properties
-			dependsOn			= @($dependsOn | Sort-Object -Unique)
-			# ExtendedLocation
-		}
+			type 		= 'Microsoft.Compute/virtualMachines'
+			apiVersion	= '2025-04-01'
+			dependsOn	= @($dependsOn | Sort-Object -Unique)
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
 
-		if ($identity.type -ne 'None') {
-			if ($identity.userAssignedIdentities.count -eq 0) {
-				$identity.Remove('userAssignedIdentities')
-			}
-			$resource.identity = $identity
+			identity	= get-identity $az_res
+			# plan		only used for marketplace images
+			properties	= $properties
 		}
+		add-resourcesALL $resource $az_res
 
+		test-property -uselessProperty 'plan' $az_res.Plan
+
+		# test location
 		$vmLocation = $az_res.Location
 		if ($sourceLocation -ne $vmLocation) {
 			write-logFileError "VM '$($az_res.Name)' is in different region" `
 								"Source region: '$sourceLocation'" `
 								"VM region: '$vmLocation'"
 		}
-
-		add-resourcesALL $resource $az_res
 	}
 }
 
@@ -19259,94 +20054,140 @@ function add-az_virtualNetworks {
 #--------------------------------------------------------------
 	foreach ($az_res in $script:az_virtualNetworks) {
 
+		#--------------------------------------------------------------
 		# Subnets
 		$subnets = @()
 		foreach ($sub in $az_res.Subnets) {
 
 			# delegations
 			$delegations = @()
-			foreach ($del in $sub.Delegations) {
-				$delegation = @{
-					name = $del.Name
+			foreach ($item in $sub.Delegations) {
+				$del = @{
+					name = convertTo-String $item.Name
 					properties	= @{
-						serviceName = $del.ServiceName
+						serviceName = convertTo-String $item.ServiceName
 					}
+					type = 'Microsoft.Network/virtualNetworks/subnets/delegations'
 				}
-				$delegations += $delegation
+				$delegations += $del
 			}
 
 			# exsisting serviceEndpoints
 			$serviceEndpoints = @()
-			foreach ($sep in $sub.ServiceEndpoints) {
-				$serviceEndpoint = @{
-					locations							= $sep.Locations -as [array]
-					# networkIdentifier
-					service								= $sep.Service
+			foreach ($item in $sub.ServiceEndpoints) {
+				$ep = @{
+					# locations							just a display property?
+					# networkIdentifier					sub resource ID, not needed?
+					service								= convertTo-String $item.Service
 				}
-				$serviceEndpoints += $serviceEndpoint
+				$serviceEndpoints += $ep
 			}
 
 			# Subnet resource
 			$subnet = @{
-				name = $sub.Name
+				name 									= $sub.Name
 				properties = @{
-					addressPrefix						= $sub.AddressPrefix[0]
-					# addressPrefixes
+					addressPrefix						= (split-az_singleMulti $sub.AddressPrefix).single
+					addressPrefixes						= (split-az_singleMulti $sub.AddressPrefix).multi
 					# applicationGatewayIPConfigurations
-					defaultOutboundAccess				= $sub.DefaultOutboundAccess
+					defaultOutboundAccess				= convertTo-Boolean $sub.DefaultOutboundAccess
 					delegations							= $delegations
-					networkSecurityGroup				= get-bicepIdStructById $sub.NetworkSecurityGroup.Id
-					# privateEndpointNetworkPolicies		= $sub.PrivateEndpointNetworkPolicies
-					privateLinkServiceNetworkPolicies	= $sub.PrivateLinkServiceNetworkPolicies
-					# routeTable
+					# ipAllocations
+					# ipamPoolPrefixAllocations
+					natGateway 							= get-bicepReference $sub.NatGateway.Id
+					networkSecurityGroup				= get-bicepReference $sub.NetworkSecurityGroup.Id
+					privateEndpointNetworkPolicies		= convertTo-String $sub.PrivateEndpointNetworkPolicies
+					privateLinkServiceNetworkPolicies	= convertTo-String $sub.PrivateLinkServiceNetworkPolicies
+					routeTable							= get-bicepReference $sub.RouteTable.Id
 					# serviceEndpointPolicies
 					serviceEndpoints					= $serviceEndpoints
+					# serviceGateway
+					# sharingScope
 				}
 			}
-
-			# natGateway
-			if (!$skipNatGateway) {
-				$subnet.properties.natGateway = get-bicepIdStructById $sub.NatGateway.Id
-			}
-
 			$subnets += $subnet
+
+			#========================================
+			$script:testResourceName = $sub.Name
+			$script:testResourceType = 'subnet'
+			#========================================
+
+			test-property -unknownProperty 'applicationGatewayIPConfigurations'
+			test-property 'ipAllocations' $sub.IpAllocations
+			test-property 'ipamPoolPrefixAllocations' $sub.IpamPoolPrefixAllocations
+			test-property 'serviceEndpointPolicies' $sub.ServiceEndpointPolicies
+			test-property -unknownProperty 'serviceGateway'
+			test-property -unknownProperty 'sharingScope'
 		}
 
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'vnet'
+		#========================================
+
+		# dhcpOptions
+		$dhcpOptions = $null
+		if ($az_res.DhcpOptions.DnsServers.Count -gt 0) {
+			$dhcpOptions = @{
+				dnsServers = @($az_res.DhcpOptions.DnsServers)
+			}
+		}
+
+		# ddosProtectionPlan
+		$ddosProtectionPlan = $null
+		if ($null -ne $az_res.DdosProtectionPlan.Id) {
+			$ddosProtectionPlan = @{
+				id = $az_res.DdosProtectionPlan.Id	# use existing DDOS protection plan. Do not copy the plan
+			}
+		}
+
+		#--------------------------------------------------------------
 		# create resource
 		$resource = @{
-			type 				= 'Microsoft.Network/virtualNetworks'
-			apiVersion			= '2022-05-01'
-			properties			= @{
+			type 		= 'Microsoft.Network/virtualNetworks'
+			apiVersion	= '2025-05-01'
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+			properties	= @{
 				addressSpace = @{
-					addressPrefixes			= $az_res.AddressSpace.AddressPrefixes -as [array]
+					addressPrefixes			= @($az_res.AddressSpace.AddressPrefixes)
 					# ipamPoolPrefixAllocations
 				}
 				# bgpCommunities
-				# ddosProtectionPlan
-				# dhcpOptions
-				# enableDdosProtection 		= $az_res.EnableDdosProtection
-				# enableVmProtection 
+				DdosProtectionPlan			= $ddosProtectionPlan
+				dhcpOptions					= $dhcpOptions			
+				enableDdosProtection 		= convertTo-Boolean $az_res.EnableDdosProtection
+				# enableVmProtection
 				encryption = @{
-					enabled					= $az_res.Encryption.Enabled
-					enforcement				= $az_res.Encryption.Enforcement
+					enabled					= convertTo-Boolean $az_res.Encryption.Enabled
+					enforcement				= convertTo-String $az_res.Encryption.Enforcement
 				}
-				flowTimeoutInMinutes		= $az_res.FlowTimeoutInMinutes
+				flowTimeoutInMinutes		= $az_res.FlowTimeoutInMinutes # [int]
+				# ipAllocations
+				privateEndpointVNetPolicies	= convertTo-String $az_res.PrivateEndpointVNetPolicies
 				subnets						= $subnets
 				# virtualNetworkPeerings
-			} 
-			# tags
+			}
 		}
-
 		add-resourcesALL $resource $az_res
+
+		test-property 'addressSpace.ipamPoolPrefixAllocations' $az_res.AddressSpace.IpamPoolPrefixAllocations
+		test-property 'bgpCommunities' $az_res.BgpCommunities
+		test-property -unknownProperty 'enableVmProtection'
+		test-property 'ipAllocations' $az_res.IpAllocations
+		test-property 'virtualNetworkPeerings' $az_res.VirtualNetworkPeerings
 	}
 }
 
 #--------------------------------------------------------------
 function add-az_networkInterfaces {
 #--------------------------------------------------------------
-
 	foreach ($az_res in $script:az_networkInterfaces) {
 
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'nic'
+		#========================================
 		$ipConfigurations = @()
 		$dependsOn = @()
 
@@ -19356,70 +20197,93 @@ function add-az_networkInterfaces {
 			# loadBalancerBackendAddressPools
 			$backendAddressPools = @()
 			foreach ($item in $conf.LoadBalancerBackendAddressPools) {
-				$backendAddressPools += get-bicepResourceFunctionById $item.Id ([ref] $dependsOn)
+				$backendAddressPools += get-bicepReference $item.Id ([ref] $dependsOn)
 			}
 
 			# loadBalancerInboundNatRules
 			$inboundNatRules = @()
 			foreach ($item in $conf.LoadBalancerInboundNatRules) {
-				$inboundNatRules += get-bicepResourceFunctionById $item.Id ([ref] $dependsOn)
+				$inboundNatRules += get-bicepReference $item.Id ([ref] $dependsOn)
+			}
+
+			#applicationSecurityGroups
+			$applicationSecurityGroups = @()
+			foreach ($item in $conf.ApplicationSecurityGroups) {
+				$applicationSecurityGroups += get-bicepReference $item.Id
 			}
 
 			$ipConfig = @{
-				name 		= $conf.Name
+				name 								= $conf.Name
 				properties 	= @{
-					privateIPAllocationMethod		= $conf.PrivateIpAllocationMethod -as [string]
-					privateIPAddressVersion			= $conf.PrivateIpAddressVersion
-					privateIPAddress				= $conf.PrivateIpAddress
-					primary							= $conf.Primary
-					publicIPAddress					= get-bicepIdStructById $conf.PublicIpAddress.Id -forceBicep
+					# applicationGatewayBackendAddressPools
+					applicationSecurityGroups		= $applicationSecurityGroups
+					# gatewayLoadBalancer
 					loadBalancerBackendAddressPools	= $backendAddressPools
 					loadBalancerInboundNatRules		= $inboundNatRules
+					primary							= convertTo-Boolean $conf.Primary
+
+				# always set allocation method static in RGCOPY
+					privateIPAllocationMethod		= 'Static' # $conf.PrivateIpAllocationMethod -as [string]
+					privateIPAddress				= convertTo-String $conf.PrivateIpAddress
+					# privateIPAddressPrefixLength	= $conf.PrivateIpAddressPrefixLength	# not used for Static
+					privateIPAddressVersion			= convertTo-String $conf.PrivateIpAddressVersion
+					
+					publicIPAddress					= get-bicepReference $conf.PublicIpAddress.Id
+					subnet							= get-bicepReference $conf.Subnet.Id ([ref] $dependsOn)
+					# virtualNetworkTaps
 				}
 			}
-
-			if ($cloneOrMergeMode) {
-				$ipConfig.properties.subnet = get-bicepIdStructById $conf.Subnet.Id
-			}
-			else {
-				$ipConfig.properties.subnet = get-bicepResourceFunctionById $conf.Subnet.Id ([ref] $dependsOn)
-			}
-
 			$ipConfigurations += $ipConfig
+
+			test-property 'applicationGatewayBackendAddressPools' $conf.ApplicationGatewayBackendAddressPools
+			test-property 'gatewayLoadBalancer' $conf.GatewayLoadBalancer
+			test-property 'virtualNetworkTaps' $conf.VirtualNetworkTaps
 		}
 
-		# # dnsSettings
-		# if (!$cloneOrMergeMode -or ($Null -eq $az_res.DnsSettings)) {
-		# 	$dnsSettings = $Null
-		# }
-		# else {
-		# 	dnsServers = $az_res.
-		# }
-
-		# properties
-		$properties = @{
-			# auxiliaryMode				= $az_res.AuxiliaryMode
-			# auxiliarySku				= $az_res.AuxiliarySku
-			disableTcpStateTracking		= convertTo-Boolean $az_res.DisableTcpStateTracking
-			# dnsSettings					= $dnsSettings
-
-
-			enableAcceleratedNetworking = $az_res.EnableAcceleratedNetworking
-			ipConfigurations			= $ipConfigurations
-			networkSecurityGroup		= get-bicepIdStructById $az_res.NetworkSecurityGroup.Id
+		# dnsSettings
+		$dnsSettings = @{
+			dnsServers = @()
+			internalDnsNameLabel = convertTo-String $az_res.InternalDnsNameLabel
+		}
+		foreach ($item in $az_res.DnsServers) {
+			$dnsSettings.dnsServers += $item
+		}
+		if ($Null -eq $az_res.DnsSettings) {
+			$dnsSettings = $Null
 		}
 
+		#--------------------------------------------------------------
 		# create resource
-		$dependsOn = @($dependsOn | Sort-Object -Unique)
 		$resource = @{
-			type 				= 'Microsoft.Network/networkInterfaces'
-			apiVersion			= '2023-02-01'
-			dependsOn 			= $dependsOn 
-			properties			= $properties
-			# extendedLocation
+			type 		= 'Microsoft.Network/networkInterfaces'
+			apiVersion	= '2025-05-01'
+			dependsOn 	= @($dependsOn | Sort-Object -Unique)
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+			properties	= @{
+				auxiliaryMode				= convertTo-String $az_res.AuxiliaryMode
+				auxiliarySku				= convertTo-String $az_res.AuxiliarySku
+				disableTcpStateTracking		= convertTo-Boolean $az_res.DisableTcpStateTracking
+				dnsSettings					= $dnsSettings
+				enableAcceleratedNetworking = convertTo-Boolean $az_res.EnableAcceleratedNetworking
+				enableIPForwarding			= convertTo-Boolean $az_res.EnableIPForwarding
+				ipConfigurations			= $ipConfigurations
+				# migrationPhase			# Display property: 'Abort', 'Commit', 'Committed', 'None', 'Prepare'
+				networkSecurityGroup		= get-bicepReference $az_res.NetworkSecurityGroup.Id
+				# nicType					# 'Elastic', 'Standard'
+				# privateLinkService		# used for Private Endpoints (NIC skipped by RGCOPY)
+				# workloadType				# used for BareMetal resources
+			}
 		}
 
-		add-resourcesALL $resource $az_res
+		test-property -displayProperty 'migrationPhase'
+		test-property -unknownProperty 'nicType'
+		test-property -unknownProperty 'workloadType'
+
+		# skip NICs of private endpoints
+		if ($Null -eq $az_res.PrivateEndpoint.Id) {
+			add-resourcesALL $resource $az_res
+		}
 	}
 }
 
@@ -19428,46 +20292,194 @@ function add-az_publicIPAddresses {
 #--------------------------------------------------------------
 	foreach ($az_res in $script:az_publicIPAddresses) {
 
-		if ($setIpTag.length -ne 0) {
-			# create new IP tag
-			$ipTags = @(
-				@{
-					ipTagType	= $setIpTagType
-					tag			= $setIpTag
-				}
-			)
-		}
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'ipAddress'
+		#========================================
 
-		elseif ('setIpTag' -notin $boundParameterNames) {
-			# copy existing IP tags
-			$ipTags = @()
-			foreach ($tag in $az_res.IpTags) {
-				if ($tag.Tag.Length -ne 0) {
-					$ipTags += @{
-						ipTagType	= $tag.IpTagType
-						tag			= $tag.Tag
-					}
+		# ddosProtectionPlan
+		$ddosSettings = $null
+		if ($null -ne $az_res.DdosSettings) {
+			# DOS Settings
+			$ddosSettings = @{
+				ddosProtectionPlan  	= $null
+				protectionMode			= convertTo-String $az_res.DdosSettings.ProtectionMode
+			}
+			# use existing DDOS protection plan. Do not copy the plan
+			if ($null -ne $az_res.DdosProtectionPlan.Id) {
+				$ddosSettings.ddosProtectionPlan = @{
+					id = $az_res.DdosProtectionPlan.Id
 				}
 			}
 		}
 
-		if (!$ipTagEnabled) {
-			# delete IP tags
-			$ipTags = @()
+		#--------------------------------------------------------------
+		# create resource
+		$resource = @{
+			type 		= 'Microsoft.Network/publicIPAddresses'
+			apiVersion	= '2025-05-01'
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+			sku			= @{
+				name 						= convertTo-String $az_res.Sku.Name
+				tier 						= convertTo-String $az_res.Sku.Tier
+			}
+
+			zones = get-supportedZones 'ipAddress' $az_res.Name $az_res.Zones
+			properties	= @{
+				ddosSettings				= $ddosSettings
+				# deleteOption
+				# dnsSettings
+				idleTimeoutInMinutes		= $az_res.IdleTimeoutInMinutes # [int]
+				# ipAddress
+				ipTags						= get-az_ipTags $az_res.IpTags
+				# linkedPublicIPAddress
+				# migrationPhase	
+				# natGateway	
+				publicIPAddressVersion		= convertTo-String $az_res.PublicIpAddressVersion
+				publicIPAllocationMethod	= convertTo-String $az_res.PublicIpAllocationMethod
+				publicIPPrefix				= get-bicepReference $az_res.PublicIpPrefix.Id
+				# servicePublicIPAddress
+			}
+		}
+		add-resourcesALL $resource $az_res
+
+		test-property -unknownProperty 'deleteOption' # Belongs to VM
+		test-property 'dnsSettings' $az_res.DnsSettings # CANNOT COPY DNS SETTINGS BECAUSE THEY MUST BE UNIQUE
+		test-property -displayProperty 'ipAddress'	# same IP address cannot be re-used
+		test-property -displayProperty 'linkedPublicIPAddress'		# ?
+		test-property -displayProperty 'migrationPhase'
+		test-property -displayProperty 'natGateway'					# ?
+		test-property -displayProperty 'servicePublicIPAddress'		# ?
+	}
+}
+
+#--------------------------------------------------------------
+function add-az_publicIPPrefixes {
+#--------------------------------------------------------------
+	foreach ($az_res in $script:az_publicIPPrefixes) {
+
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'ipPrefix'
+		#========================================
+
+		#--------------------------------------------------------------
+		# create resource
+		$resource = @{
+			type 				= 'Microsoft.Network/publicIPPrefixes'
+			apiVersion			= '2025-05-01'
+			zones = get-supportedZones 'ipPrefix' $az_res.Name $az_res.Zones
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+			sku					= @{
+				name = $az_res.Sku.Name
+				tier = $az_res.Sku.Tier
+			}
+			properties			= @{
+				# customIPPrefix
+				ipTags					= get-az_ipTags $az_res.IpTags
+				# natGateway
+				prefixLength			= $az_res.PrefixLength # [int]
+				publicIPAddressVersion	= convertTo-String $az_res.PublicIpAddressVersion
+			}
+		}
+		add-resourcesALL $resource $az_res
+
+		test-property 'customIPPrefix' $az_res.CustomIpPrefix
+		test-property -displayProperty 'natGateway'
+	}
+}
+
+#--------------------------------------------------------------
+function add-az_natGateways {
+#--------------------------------------------------------------
+	foreach ($az_res in $script:az_natGateways) {
+
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'natGateway'
+		#========================================
+
+		$publicIpAddresses = @()
+		foreach ($ip in $az_res.PublicIpAddresses) {
+			$publicIpAddresses += get-bicepReference $ip.Id
+		}
+
+		$publicIpAddressesV6 = @()
+		foreach ($ip in $az_res.PublicIpAddressesV6) {
+			$publicIpAddressesV6 += get-bicepReference $ip.Id
+		}
+
+		$publicIpPrefixes = @()
+		foreach ($prefix in $az_res.PublicIpPrefixes) {
+			$publicIpPrefixes += get-bicepReference $prefix.Id
+		}
+
+		$publicIpPrefixesV6 = @()
+		foreach ($prefix in $az_res.PublicIpPrefixesV6) {
+			$publicIpPrefixesV6 += get-bicepReference $prefix.Id
+		}
+
+		#--------------------------------------------------------------
+		# create resource
+		$resource = @{
+			type 				= 'Microsoft.Network/natGateways'
+			apiVersion			= '2025-05-01'
+			zones 				= get-supportedZones 'natGateway' $az_res.Name $az_res.Zones
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+			sku					= @{
+				name = $az_res.Sku.Name -as [string]
+			}
+			properties		= @{
+				idleTimeoutInMinutes	= $az_res.IdleTimeoutInMinutes # [int]
+				publicIpAddresses		= $publicIpAddresses
+				publicIpAddressesV6		= $publicIpAddressesV6
+				publicIpPrefixes		= $publicIpPrefixes
+				publicIpPrefixesV6		= $publicIpPrefixesV6
+				# serviceGateway
+				# sourceVirtualNetwork
+			}
+		}
+		add-resourcesALL $resource $az_res
+
+		test-property -unknownProperty 'serviceGateway'
+		test-property -displayProperty 'sourceVirtualNetwork'
+	}
+}
+
+#--------------------------------------------------------------
+function add-az_routeTables {
+#--------------------------------------------------------------
+	foreach ($az_res in $script:az_routeTables) {
+
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'routeTable'
+		#========================================
+
+		$routes = @()
+		foreach ($route in $az_res.Routes) {
+			$routes += @{
+				name = $route.Name
+				properties = @{
+					addressPrefix		= convertTo-String $route.AddressPrefix
+					nextHopIpAddress	= convertTo-String $route.NextHopIpAddress
+					nextHopType			= convertTo-String $route.NextHopType
+				}
+			}
 		}
 
 		# create resource
 		$resource = @{
-			type 				= 'Microsoft.Network/publicIPAddresses'
-			apiVersion			= '2022-11-01'
-			sku					= @{
-				name = $az_res.Sku.Name -as [string]
-			}
-			properties			= @{
-				publicIPAddressVersion		= $az_res.PublicIpAddressVersion -as [string]
-				publicIPAllocationMethod	= $az_res.PublicIpAllocationMethod -as [string]
-				idleTimeoutInMinutes		= $az_res.IdleTimeoutInMinutes
-				ipTags						= $ipTags
+			type		= 'Microsoft.Network/routeTables'
+			apiVersion	= '2025-05-01'
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+			properties	= @{
+				disableBgpRoutePropagation	= convertTo-Boolean $az_res.DisableBgpRoutePropagation
+				routes						= $routes
 			}
 		}
 
@@ -19476,71 +20488,70 @@ function add-az_publicIPAddresses {
 }
 
 #--------------------------------------------------------------
-function test-angleBrackets {
+function add-az_applicationSecurityGroups {
 #--------------------------------------------------------------
-	param (
-		$string
-	)
+	foreach ($az_res in $script:az_applicationSecurityGroups) {
 
-	if ($string -like '<*>') {
-		$string = $string	-replace '<', '' `
-							-replace '>', ''
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'appSecGroup'
+		#========================================
+
+		# create resource
+		$resource = @{
+			type		= 'Microsoft.Network/applicationSecurityGroups'
+			apiVersion	= '2025-05-01'
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+			properties	= @{}
+		}
+
+		add-resourcesALL $resource $az_res
 	}
-
-	return $string
 }
 
 #--------------------------------------------------------------
 function add-az_networkSecurityGroups {
 #--------------------------------------------------------------
 	foreach ($az_res in $script:az_networkSecurityGroups) {
+
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'nwSecGroup'
+		#========================================
 		
 		$securityRules = @()
 		foreach ($rule in $az_res.SecurityRules) {
 
+			$destASGs = @()
+			foreach ($item in $rule.DestinationApplicationSecurityGroups) {
+				$destASGs += get-bicepReference $item.Id
+			}
+
+			$sourceASGs = @()
+			foreach ($item in $rule.SourceApplicationSecurityGroups) {
+				$sourceASGs += get-bicepReference $item.Id
+			}
+
 			$securityRule = @{
 				name				= $rule.Name
 				properties			= @{
-					access						= $rule.Access -as [string]
-					description					= test-angleBrackets $rule.Description
-					# destinationApplicationSecurityGroups
-					direction					= $rule.Direction -as [string]
-					priority					= $rule.Priority
-					protocol					= $rule.Protocol -as [string]
-					# sourceApplicationSecurityGroups
+					access									= convertTo-String $rule.Access
+					description								= remove-angleBrackets $rule.Description
+					destinationAddressPrefix				= (split-az_singleMulti $rule.DestinationAddressPrefix).single
+					destinationAddressPrefixes				= (split-az_singleMulti $rule.DestinationAddressPrefix).multi
+					destinationApplicationSecurityGroups 	= $destASGs
+					destinationPortRange					= (split-az_singleMulti $rule.DestinationPortRange).single
+					destinationPortRanges					= (split-az_singleMulti $rule.DestinationPortRange).multi
+					direction								= convertTo-String $rule.Direction
+					priority								= $rule.Priority	# [int]
+					protocol								= convertTo-String $rule.Protocol
+					sourceAddressPrefix						= (split-az_singleMulti $rule.SourceAddressPrefix).single
+					sourceAddressPrefixes					= (split-az_singleMulti $rule.SourceAddressPrefix).multi
+					sourceApplicationSecurityGroups 		= $sourceASGs
+					sourcePortRange							= (split-az_singleMulti $rule.SourcePortRange).single
+					sourcePortRanges						= (split-az_singleMulti $rule.SourcePortRange).multi
 				}
-			}
-
-			$daPrefixes = @($rule.DestinationAddressPrefix)
-			if ($daPrefixes.count -gt 1) {
-				$securityRule.properties.destinationAddressPrefixes = $daPrefixes
-			}
-			elseif ($daPrefixes.count -eq 1) {
-				$securityRule.properties.destinationAddressPrefix = $daPrefixes[0]
-			}
-
-			$daPortRange = @($rule.DestinationPortRange)
-			if ($daPortRange.count -gt 1) {
-				$securityRule.properties.destinationPortRanges = $daPortRange
-			}
-			elseif ($daPortRange.count -eq 1) {
-				$securityRule.properties.destinationPortRange = $daPortRange[0]
-			}
-
-			$saPrefixes = @($rule.SourceAddressPrefix)
-			if ($saPrefixes.count -gt 1) {
-				$securityRule.properties.sourceAddressPrefixes = $saPrefixes
-			}
-			elseif ($saPrefixes.count -eq 1) {
-				$securityRule.properties.sourceAddressPrefix = $saPrefixes[0]
-			}
-
-			$saPortRange = @($rule.SourcePortRange)
-			if ($saPortRange.count -gt 1) {
-				$securityRule.properties.sourcePortRanges = $saPortRange
-			}
-			elseif ($saPortRange.count -eq 1) {
-				$securityRule.properties.sourcePortRange = $saPortRange[0]
 			}
 
 			# check for parameter skipSecurityRules
@@ -19550,73 +20561,21 @@ function add-az_networkSecurityGroups {
 					$toBedeleted = $True
 				}
 			}
-
 			if (!$toBedeleted) {
 				$securityRules += $securityRule 
 			}
 		}
 
+		#--------------------------------------------------------------
 		# create resource
 		$resource = @{
-			type 				= 'Microsoft.Network/networkSecurityGroups'
-			apiVersion			= '2022-11-01'
-			properties			= @{
-				securityRules = $securityRules
-			}
-		}
+			type 		= 'Microsoft.Network/networkSecurityGroups'
+			apiVersion	= '2025-05-01'
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
 
-		add-resourcesALL $resource $az_res
-	}
-}
-
-#--------------------------------------------------------------
-function add-az_publicIPPrefixes {
-#--------------------------------------------------------------
-	foreach ($az_res in $script:az_publicIPPrefixes) {
-
-		# create resource
-		$resource = @{
-			type 				= 'Microsoft.Network/publicIPPrefixes'
-			apiVersion			= '2022-11-01'
-			sku					= @{
-				name = $az_res.Sku.Name -as [string]
-			}
-			properties			= @{
-				prefixLength			= $az_res.PrefixLength
-				publicIPAddressVersion	= $az_res.PublicIpAddressVersion -as [string]
-			}
-		}
-
-		add-resourcesALL $resource $az_res
-	}
-}
-
-#--------------------------------------------------------------
-function add-az_natGateways {
-#--------------------------------------------------------------
-	foreach ($az_res in $script:az_natGateways) {
-
-		$publicIpAddresses = @()
-		foreach ($ip in $az_res.PublicIpAddresses) {
-			$publicIpAddresses += get-bicepIdStructById $ip.Id
-		}
-
-		$publicIpPrefixes = @()
-		foreach ($prefix in $az_res.PublicIpPrefixes) {
-			$publicIpPrefixes += get-bicepIdStructById $prefix.Id
-		}
-
-		# create resource
-		$resource = @{
-			type 				= 'Microsoft.Network/natGateways'
-			apiVersion			= '2022-11-01'
-			sku					= @{
-				name = $az_res.Sku.Name -as [string]
-			}
-			properties		= @{
-				idleTimeoutInMinutes	= $az_res.IdleTimeoutInMinutes
-				publicIpAddresses		= $publicIpAddresses
-				publicIpPrefixes		= $publicIpPrefixes
+			properties = @{
+				flushConnection	= convertTo-Boolean $az_res.FlushConnection
+				securityRules 	= $securityRules
 			}
 		}
 
@@ -19633,6 +20592,11 @@ function add-az_bastionHosts {
 
 	foreach ($az_res in $script:az_bastionHosts) {
 
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'bastion'
+		#========================================
+
 		$dependsOn = @()
 		$ipConfigurations = @()
 		foreach ($conf in $az_res.IpConfigurations) {
@@ -19640,34 +20604,50 @@ function add-az_bastionHosts {
 			$ipConfiguration = @{
 				name		= $conf.Name
 				properties = @{
-					privateIPAllocationMethod	= $conf.PrivateIpAllocationMethod -as [string]
-					publicIPAddress 			= get-bicepIdStructById $conf.PublicIpAddress.Id
-					subnet						= get-bicepResourceFunctionById $conf.Subnet.Id ([ref] $dependsOn)
+					privateIPAllocationMethod	= convertTo-String $conf.PrivateIpAllocationMethod
+					publicIPAddress 			= get-bicepReference $conf.PublicIpAddress.Id
+					subnet						= get-bicepReference $conf.Subnet.Id ([ref] $dependsOn)
 				}
 			}
 
 			$ipConfigurations += $ipConfiguration
 		}
 
-		# properties
-		$properties		= @{
-			dnsName		= $az_res.DnsName
-			scaleUnits	= $az_res.ScaleUnit
-			ipConfigurations = $ipConfigurations
-		}
-
+		#--------------------------------------------------------------
 		# create resource
 		$resource = @{
-			type 				= 'Microsoft.Network/bastionHosts'
-			apiVersion			= '2022-11-01'
-			sku					= @{
-				name = $az_res.Sku.Name -as [string]
-			}
+			type 			= 'Microsoft.Network/bastionHosts'
+			apiVersion		= '2025-05-01'
+			zones 			= get-supportedZones 'ipAddress' $az_res.Name $az_res.Zones
 			dependsOn 		= $dependsOn 
-			properties		= $properties
-		}
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
 
+			sku					= @{
+				name 		= convertTo-String $az_res.Sku.Name
+			}
+			properties = @{
+				disableCopyPaste			= convertTo-Boolean $az_res.DisableCopyPaste
+				# dnsName
+				# enableFileCopy
+				enableIpConnect				= convertTo-Boolean $az_res.EnableIpConnect
+				enableKerberos				= convertTo-Boolean $az_res.EnableKerberos
+				# enablePrivateOnlyBastion
+				enableSessionRecording		= convertTo-Boolean $az_res.EnableSessionRecording
+				enableShareableLink			= convertTo-Boolean $az_res.EnableShareableLink
+				enableTunneling				= convertTo-Boolean $az_res.EnableTunneling
+				ipConfigurations 			= $ipConfigurations
+				# networkAcls
+				scaleUnits					= $az_res.ScaleUnit # [int]
+				# virtualNetwork			# for Developer Bastion Host only		
+			}
+		}
 		add-resourcesALL $resource $az_res
+
+		test-property -displayProperty 'dnsName'
+		test-property -unknownProperty 'enableFileCopy'
+		test-property -unknownProperty 'enablePrivateOnlyBastion'
+		test-property -unknownProperty 'networkAcls'
+		test-property -unknownProperty 'virtualNetwork'
 	}
 }
 
@@ -19676,25 +20656,33 @@ function add-az_availabilitySets {
 #--------------------------------------------------------------
 	foreach ($az_res in $script:az_availabilitySets) {
 
-		# properties
-		$properties =  @{
-			platformUpdateDomainCount	= $az_res.PlatformUpdateDomainCount
-			platformFaultDomainCount	= $az_res.PlatformFaultDomainCount
-			virtualMachines				= $virtualMachines
-			proximityPlacementGroup		= get-bicepIdStructById $az_res.ProximityPlacementGroup.Id
-		}
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'avSet'
+		#========================================
 
 		# create resource
 		$resource =  @{
-			type 				= 'Microsoft.Compute/availabilitySets'
-			apiVersion			= '2023-03-01'
-			sku					= @{
-				name = $az_res.Sku -as [string] # "$az_res.Sku", not "$az_res.Sku.Name" !
-			}
-			properties			= $properties
-		}
+			type 		= 'Microsoft.Compute/availabilitySets'
+			apiVersion	= '2025-04-01'
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
 
+			sku = @{
+				name = convertTo-String $az_res.Sku 	# "$az_res.Sku", not "$az_res.Sku.Name" !
+				# tier									# not available in Get-AzAvailabilitySet
+			}
+			properties	= @{
+				platformFaultDomainCount	= $az_res.PlatformFaultDomainCount		# [int]
+				platformUpdateDomainCount	= $az_res.PlatformUpdateDomainCount		# [int]
+				proximityPlacementGroup		= get-bicepReference $az_res.ProximityPlacementGroup.Id
+				# scheduledEventsPolicy
+				# virtualMachines
+			}
+		}
 		add-resourcesALL $resource $az_res
+
+		test-property -unknownProperty 'scheduledEventsPolicy'
+		test-property -displayProperty 'virtualMachines'
 	}
 }
 
@@ -19703,16 +20691,106 @@ function add-az_proximityPlacementGroups {
 #--------------------------------------------------------------
 	foreach ($az_res in $script:az_proximityPlacementGroups) {
 
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'ppg'
+		#========================================	
+
 		# create resource
 		$resource = @{
-			type 				= 'Microsoft.Compute/proximityPlacementGroups'
-			apiVersion			= '2023-03-01'
-			properties			= @{
-				proximityPlacementGroupType	= $az_res.ProximityPlacementGroupType -as [string]
+			type 		= 'Microsoft.Compute/proximityPlacementGroups'
+			apiVersion	= '2025-04-01'
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+			properties	= @{
+				# colocationStatus
+				# intent
+				proximityPlacementGroupType	= convertTo-String $az_res.ProximityPlacementGroupType
 			}
 		}
+		add-resourcesALL $resource $az_res -noZones
 
+		test-property -displayProperty 'colocationStatus'
+		test-property 'intent' $az_res.Intent
+	}
+}
+
+#--------------------------------------------------------------
+function add-az_virtualMachineScaleSet {
+#--------------------------------------------------------------
+	# only support VMSS FLEX!
+	foreach ($az_res in $script:az_virtualMachineScaleSets) {
+
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'vmss'
+		#========================================
+		$orchestrationMode = convertTo-String $az_res.OrchestrationMode 
+
+		# create resource
+		$resource = @{
+			type 				= 'Microsoft.Compute/virtualMachineScaleSets'
+			apiVersion			= '2025-04-01'
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+			# identity
+			# plan
+			# sku
+
+			properties			= @{
+				# additionalCapabilities
+				# automaticRepairsPolicy
+				# constrainedMaximumCapacity
+				# doNotRunExtensionsOnOverprovisionedVMs
+				# highSpeedInterconnectPlacement
+				# hostGroup
+				orchestrationMode			= $orchestrationMode
+				# overprovision
+				platformFaultDomainCount	= $az_res.PlatformFaultDomainCount # [int]
+				# priorityMixPolicy
+				# proximityPlacementGroup
+				# resiliencyPolicy
+				# scaleInPolicy
+				# scheduledEventsPolicy
+				singlePlacementGroup		= convertTo-Boolean $az_res.SinglePlacementGroup
+				# skuProfile
+				# spotRestorePolicy
+				# upgradePolicy
+				# virtualMachineProfile
+				# zonalPlatformFaultDomainAlignMode
+				# zoneBalance
+			}
+		}
 		add-resourcesALL $resource $az_res
+
+		# resource will be removed later if orchestrationMode <> Flexible
+		if ($orchestrationMode -eq 'Flexible') {
+			test-property 'identity' $az_res.Identity
+			test-property 'plan' $az_res.Plan
+			test-property 'sku' $az_res.Sku
+
+			if ($az_res.HighSpeedInterconnectPlacement -ne 'None') {
+				test-property 'highSpeedInterconnectPlacement' $az_res.HighSpeedInterconnectPlacement
+			}
+	
+			test-property 'additionalCapabilities' $az_res.AdditionalCapabilities
+			test-property 'automaticRepairsPolicy' $az_res.AutomaticRepairsPolicy
+			test-property -unknownProperty 'constrainedMaximumCapacity'
+			test-property 'doNotRunExtensionsOnOverprovisionedVMs' $az_res.DoNotRunExtensionsOnOverprovisionedVMs
+			test-property 'hostGroup' $az_res.HostGroup
+			test-property 'overprovision' $az_res.Overprovision
+			test-property 'priorityMixPolicy' $az_res.PriorityMixPolicy
+			test-property 'proximityPlacementGroup' $az_res.ProximityPlacementGroup
+			test-property 'resiliencyPolicy' $az_res.ResiliencyPolicy
+			test-property 'scaleInPolicy' $az_res.ScaleInPolicy
+			test-property -unknownProperty 'scheduledEventsPolicy' 
+			test-property 'skuProfile' $az_res.SkuProfile
+			test-property 'spotRestorePolicy' $az_res.SpotRestorePolicy
+			test-property 'upgradePolicy' $az_res.UpgradePolicy
+			test-property 'virtualMachineProfile' $az_res.VirtualMachineProfile
+			test-property -unknownProperty 'zonalPlatformFaultDomainAlignMode'
+			test-property 'zoneBalance' $az_res.ZoneBalance
+		}
 	}
 }
 
@@ -19720,6 +20798,11 @@ function add-az_proximityPlacementGroups {
 function add-az_loadBalancers {
 #--------------------------------------------------------------
 	foreach ($az_res in $script:az_loadBalancers) {
+
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'lb'
+		#========================================
 
 		$backendAddressPools = @()
 		$frontendIPConfigurations = @()
@@ -19735,9 +20818,42 @@ function add-az_loadBalancers {
 		# backendAddressPools
 		foreach ($pool in $az_res.BackendAddressPools) {
 
+			$loadBalancerBackendAddresses = @()
+			foreach ($item in $pool.LoadBalancerBackendAddresses) {
+
+				# IP address given
+				if ($item.IpAddress.length -gt 0) {
+					$loadBalancerBackendAddresses += @{
+						name = $item.Name
+						properties = @{
+							ipAddress 		= $item.IpAddress
+							virtualNetwork	= get-bicepReference $item.VirtualNetwork.Id
+						}
+					}
+					#--------------------------------------------------------------
+					# IpAddress is set in BICEP templpate, deployment succeeds, but IpAddress is not deployed!??
+					# give a warning here:
+					test-property 'backendAddressPools.IpAddress' $item.IpAddress
+					#--------------------------------------------------------------
+				}
+			}
+
 			$addressPool = @{
 				name = $pool.Name
+				properties = @{
+					# drainPeriodInSeconds
+					loadBalancerBackendAddresses	= $loadBalancerBackendAddresses
+					# location
+					# syncMode
+					# tunnelInterfaces
+					# virtualNetwork
+				}
 			}
+			test-property -unknownProperty 'drainPeriodInSeconds'
+			test-property -unknownProperty 'location'
+			test-property 'backendAddressPools.syncMode' $pool.SyncMode
+			test-property 'backendAddressPools.tunnelInterfaces' $pool.TunnelInterfaces
+			test-property -displayProperty 'virtualNetwork' # defined in loadBalancerBackendAddresses
 
 			$backendAddressPools += $addressPool
 		}
@@ -19750,15 +20866,17 @@ function add-az_loadBalancers {
 				name		= $conf.Name
 				properties	= @{
 					# gatewayLoadBalancer
-					privateIPAddress			= $conf.PrivateIpAddress
-					privateIPAddressVersion		= $conf.PrivateIpAddressVersion
-					privateIPAllocationMethod	= $conf.PrivateIpAllocationMethod -as [string]
-					publicIPAddress				= get-bicepIdStructById $conf.PublicIpAddress.Id
-					publicIPPrefix				= get-bicepIdStructById $conf.PublicIPPrefix.Id
-					subnet						= get-bicepResourceFunctionById $conf.Subnet.Id ([ref] $dependsOn)
+					privateIPAddress			= convertTo-String $conf.PrivateIpAddress
+					privateIPAddressVersion		= convertTo-String $conf.PrivateIpAddressVersion
+					privateIPAllocationMethod	= convertTo-String $conf.PrivateIpAllocationMethod
+					publicIPAddress				= get-bicepReference $conf.PublicIpAddress.Id
+					publicIPPrefix				= get-bicepReference $conf.PublicIPPrefix.Id
+					subnet						= get-bicepReference $conf.Subnet.Id ([ref] $dependsOn)
 				}
 			}
+			test-property 'frontendIpConf.gatewayLoadBalancer' $conf.GatewayLoadBalancer
 
+			# add zones
 			$zones = @()
 			foreach ($zone in $conf.Zones) {
 				$zones += $zone -as [string]
@@ -19773,18 +20891,19 @@ function add-az_loadBalancers {
 
 		#--------------------------------------------------------------
 		# inboundNatPools
+		# ONLY POSSIBLE FOR VMSS 
 		foreach ($pool in $az_res.inboundNatPools) {
 			$natpool = @{
 				name		= $pool.Name
 				properties	= @{
-					backendPort					= $pool.BackendPort
-					enableFloatingIP			= $pool.EnableFloatingIP
-					enableTcpReset				= $pool.EnableTcpReset
-					frontendIPConfiguration		= get-bicepResourceFunctionById $pool.FrontendIPConfiguration.Id
-					frontendPortRangeEnd		= $pool.FrontendPortRangeEnd
-					frontendPortRangeStart		= $pool.FrontendPortRangeStart
-					idleTimeoutInMinutes		= $pool.IdleTimeoutInMinutes
-					protocol					= $pool.Protocol
+					backendPort					= $pool.BackendPort # [int]
+					enableFloatingIP			= convertTo-Boolean $pool.EnableFloatingIP
+					enableTcpReset				= convertTo-Boolean $pool.EnableTcpReset
+					frontendIPConfiguration		= get-bicepReference $pool.FrontendIPConfiguration.Id
+					frontendPortRangeEnd		= $pool.FrontendPortRangeEnd # [int]
+					frontendPortRangeStart		= $pool.FrontendPortRangeStart # [int]
+					idleTimeoutInMinutes		= $pool.IdleTimeoutInMinutes # [int]
+					protocol					= convertTo-String $pool.Protocol
 				}
 			}
 			$inboundNatPools += $natpool
@@ -19795,16 +20914,16 @@ function add-az_loadBalancers {
 			$natrule = @{
 				name		= $rule.Name
 				properties	= @{
-					backendAddressPool			= get-bicepResourceFunctionById $rule.BackendAddressPool.Id
-					backendPort					= $rule.BackendPort
-					enableFloatingIP			= $rule.EnableFloatingIP
-					enableTcpReset				= $rule.EnableTcpReset
-					frontendIPConfiguration		= get-bicepResourceFunctionById $rule.FrontendIPConfiguration.Id
-					frontendPort				= $rule.FrontendPort
-					frontendPortRangeEnd		= $rule.FrontendPortRangeEnd
-					frontendPortRangeStart		= $rule.FrontendPortRangeStart
-					idleTimeoutInMinutes		= $rule.IdleTimeoutInMinutes
-					protocol					= $rule.Protocol
+					backendAddressPool			= get-bicepReference $rule.BackendAddressPool.Id
+					backendPort					= $rule.BackendPort # [int]
+					enableFloatingIP			= convertTo-Boolean $rule.EnableFloatingIP
+					enableTcpReset				= convertTo-Boolean $rule.EnableTcpReset
+					frontendIPConfiguration		= get-bicepReference $rule.FrontendIPConfiguration.Id
+					frontendPort				= $rule.FrontendPort # [int]
+					frontendPortRangeEnd		= $rule.FrontendPortRangeEnd # [int]
+					frontendPortRangeStart		= $rule.FrontendPortRangeStart # [int]
+					idleTimeoutInMinutes		= $rule.IdleTimeoutInMinutes # [int]
+					protocol					= convertTo-String $rule.Protocol
 				}
 			}
 			$inboundNatRules += $natrule
@@ -19816,24 +20935,25 @@ function add-az_loadBalancers {
 
 			$pools = @()
 			foreach ($pool in $rule.BackendAddressPools) {
-				$pools += get-bicepResourceFunctionById $pool.Id
+				$pools += get-bicepReference $pool.Id
 			}
 
 			$lbRule = @{
 				name = $rule.Name
 				properties = @{
-					backendAddressPool		= get-bicepResourceFunctionById $rule.BackendAddressPool.Id
-					backendAddressPools		= $pools
-					backendPort				= $rule.BackendPort
-					disableOutboundSnat		= $rule.DisableOutboundSNAT
-					enableFloatingIP		= $rule.EnableFloatingIP
-					enableTcpReset			= $rule.EnableTcpReset
-					frontendIPConfiguration	= get-bicepResourceFunctionById $rule.FrontendIPConfiguration.Id
-					frontendPort			= $rule.FrontendPort
-					idleTimeoutInMinutes	= $rule.IdleTimeoutInMinutes
-					loadDistribution		= $rule.LoadDistribution -as [string]
-					probe					= get-bicepResourceFunctionById $rule.Probe.Id
-					protocol				= $rule.Protocol -as [string]
+					backendAddressPool			= get-bicepReference $rule.BackendAddressPool.Id
+					backendAddressPools			= $pools
+					backendPort					= $rule.BackendPort # [int]
+					disableOutboundSnat			= convertTo-Boolean $rule.DisableOutboundSNAT
+					enableConnectionTracking	= convertTo-Boolean $rule.EnableConnectionTracking
+					enableFloatingIP			= convertTo-Boolean $rule.EnableFloatingIP
+					enableTcpReset				= convertTo-Boolean $rule.EnableTcpReset
+					frontendIPConfiguration		= get-bicepReference $rule.FrontendIPConfiguration.Id
+					frontendPort				= $rule.FrontendPort # [int]
+					idleTimeoutInMinutes		= $rule.IdleTimeoutInMinutes # [int]
+					loadDistribution			= convertTo-String $rule.LoadDistribution
+					probe						= get-bicepReference $rule.Probe.Id
+					protocol					= convertTo-String $rule.Protocol
 				}
 			}
 			
@@ -19846,19 +20966,18 @@ function add-az_loadBalancers {
 
 			$frontendConfigs = @()
 			foreach ($frontendConfig in $rule.FrontendIPConfigurations) {
-				$frontendConfigs += get-bicepResourceFunctionById $frontendConfig.Id
-				
+				$frontendConfigs += get-bicepReference $frontendConfig.Id	
 			}
 
 			$obrule = @{
 				name = $rule.Name
 				properties = @{
-					allocatedOutboundPorts		= $rule.AllocatedOutboundPorts
-					backendAddressPool			= get-bicepResourceFunctionById $rule.BackendAddressPool.Id
-					enableTcpReset				= $rule.EnableTcpReset
+					allocatedOutboundPorts		= $rule.AllocatedOutboundPorts # [int]
+					backendAddressPool			= get-bicepReference $rule.BackendAddressPool.Id
+					enableTcpReset				= convertTo-Boolean $rule.EnableTcpReset
 					frontendIPConfigurations	= $frontendConfigs
-					idleTimeoutInMinutes		= $rule.IdleTimeoutInMinutes
-					protocol					= $rule.Protocol
+					idleTimeoutInMinutes		= $rule.IdleTimeoutInMinutes # [int]
+					protocol					= convertTo-String $rule.Protocol
 				}
 			}
 
@@ -19872,12 +20991,13 @@ function add-az_loadBalancers {
 			$lbProbe = @{
 				name = $probe.Name
 				properties = @{
-					intervalInSeconds	= $probe.IntervalInSeconds
-					numberOfProbes		= $probe.NumberOfProbes
-					port				= $probe.Port
-					probeThreshold		= $probe.ProbeThreshold
-					protocol			= $probe.Protocol -as [string]
-					requestPath			= $probe.RequestPath
+					intervalInSeconds			= $probe.IntervalInSeconds # [int]
+					noHealthyBackendsBehavior	= convertTo-String $probe.NoHealthyBackendsBehavior
+					numberOfProbes				= $probe.NumberOfProbes # [int]
+					port						= $probe.Port # [int]
+					probeThreshold				= $probe.ProbeThreshold # [int]
+					protocol					= convertTo-String $probe.Protocol
+					requestPath					= convertTo-String $probe.RequestPath
 				}
 			}
 
@@ -19888,25 +21008,16 @@ function add-az_loadBalancers {
 		# create resource
 		$dependsOn = @($dependsOn | Sort-Object -Unique)
 
-		# $extendedLocation = $Null
-		# if ($Null -ne $az_res.ExtendedLocation) {
-		# 	$extendedLocation = @{
-		# 		name = $az_res.ExtendedLocation.Name
-		# 		type = $az_res.ExtendedLocation.Type -as [string]
-		# 	}
-		# }
-
-		# $extendedLocation = $az_res.ExtendedLocation
-
 		$resource = @{
 			type 				= 'Microsoft.Network/loadBalancers'
-			apiVersion			= '2023-02-01'
-			sku					= @{
-				name = $az_res.Sku.Name -as [string]
-				tier = $az_res.Sku.Tier -as [string]
-			}
-			# extendedLocation	= $extendedLocation
+			apiVersion			= '2025-05-01'
 			dependsOn 			= $dependsOn
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+			sku	= @{
+				name = convertTo-String $az_res.Sku.Name
+				tier = convertTo-String $az_res.Sku.Tier
+			}
 
 			properties			=  @{
 				backendAddressPools			= $backendAddressPools
@@ -19916,31 +21027,12 @@ function add-az_loadBalancers {
 				loadBalancingRules			= $loadBalancingRules
 				outboundRules				= $outboundRules
 				probes						= $loadBalancingProbes
+				# scope
 			}
 		}
-
 		add-resourcesALL $resource $az_res
-	}
-}
 
-
-#--------------------------------------------------------------
-function add-az_virtualMachineScaleSet {
-#--------------------------------------------------------------
-	foreach ($az_res in $script:az_virtualMachineScaleSets) {
-
-		# create resource
-		$resource = @{
-			type 				= 'Microsoft.Compute/virtualMachineScaleSets'
-			apiVersion			= '2023-03-01'
-			properties			= @{
-				singlePlacementGroup		= $az_res.SinglePlacementGroup
-				orchestrationMode			= $az_res.OrchestrationMode -as [string]
-				platformFaultDomainCount	= $az_res.PlatformFaultDomainCount
-			}
-		}
-
-		add-resourcesALL $resource $az_res
+		test-property -unknownProperty 'scope' 
 	}
 }
 
@@ -19950,260 +21042,869 @@ function add-az_storageAccounts {
 	# parent resource
 	foreach ($az_res in $script:az_storageAccounts) {
 
-		#--------------------------------------------------------------
+		#========================================
+		$script:testResourceName = $az_res.StorageAccountName
+		$script:testResourceType = 'sa'
+		#========================================
+
 		# calculate networkAcls
 		$ipRules = @()
-		# foreach ($rule in $az_res.NetworkRuleSet.IpRules) {
-		# 	$ipRules += @{
-		# 		action	= 'Allow'
-		# 		value	= $rule.IPAddressOrRange
-		# 	}
-		# }
+		foreach ($rule in $az_res.NetworkRuleSet.IpRules) {
+			$ipRules += @{
+				action	= 'Allow'
+				value	= convertTo-String $rule.IPAddressOrRange
+			}
+		}
 
 		$resourceAccessRules = @()
 		foreach ($rule in $az_res.NetworkRuleSet.ResourceAccessRules) {
 			$resourceAccessRules += @{
-				resourceId	= $rule.ResourceId
-				tenantId	= $rule.TenantId
+				resourceId	= convertTo-String $rule.ResourceId
+				tenantId	= convertTo-String $rule.TenantId
 			}
 		}
 
 		$virtualNetworkRules = @()
-		# foreach ($rule in $az_res.NetworkRuleSet.VirtualNetworkRules) {
-		# 	$virtualNetworkRules += @{
-		# 		action	= 'Allow'
-		# 		id		= $rule.VirtualNetworkResourceId
-		# 	}
-		# }
+		foreach ($rule in $az_res.NetworkRuleSet.VirtualNetworkRules) {
+			$virtualNetworkRules += @{
+				action	= 'Allow'
+				id		= convertTo-String $rule.VirtualNetworkResourceId
+			}
+		}
 
 		$networkAcls = @{
-			bypass 						= $az_res.NetworkRuleSet.Bypass -as [string]
-			defaultAction 				= $az_res.NetworkRuleSet.DefaultAction -as [string]
+			bypass 						= convertTo-String $az_res.NetworkRuleSet.Bypass
+			defaultAction 				= convertTo-String $az_res.NetworkRuleSet.DefaultAction
 			ipRules						= $ipRules
+			# ipv6Rules
 			resourceAccessRules			= $resourceAccessRules
 			virtualNetworkRules			= $virtualNetworkRules
 		}
+		test-property -unknownProperty 'ipv6Rules' 
+
+		#--------------------------------------------------------------
+		$azureFilesIdentityBasedAuthentication = @{
+			# activeDirectoryProperties
+			defaultSharePermission	= convertTo-String $az_res.AzureFilesIdentityBasedAuth.DefaultSharePermission
+			directoryServiceOptions	= convertTo-String $az_res.AzureFilesIdentityBasedAuth.DirectoryServiceOptions
+			smbOAuthSettings		= @{
+				isSmbOAuthEnabled	= convertTo-Boolean $az_res.AzureFilesIdentityBasedAuth.SmbOAuthSettings.IsSmbOAuthEnabled
+			}
+		}
+		test-property 'activeDirectoryProperties' $az_res.AzureFilesIdentityBasedAuth.ActiveDirectoryProperties
 
 		#--------------------------------------------------------------
 		# create resource
 		$resource = @{
 			type 				= 'Microsoft.Storage/storageAccounts'
-			apiVersion			= '2024-01-01'
-			sku = @{
-				name			= $az_res.Sku.Name
-			}
-			kind				= $az_res.Kind
-			# Tags
-			properties			= @{
-				accessTier						= $az_res.AccessTier -as [string]
-				allowBlobPublicAccess			= $az_res.AllowBlobPublicAccess
-				allowCrossTenantReplication		= $az_res.AllowCrossTenantReplication
-				allowedCopyScope				= $az_res.AllowedCopyScope
-				allowSharedKeyAccess			= $az_res.AllowSharedKeyAccess
-				# = $az_res.AzureFilesIdentityBasedAuth
-				# BlobRestoreStatus
-				# Context
-				# CreationTime
-				# = $az_res.CustomDomain
-				dnsEndpointType					= $az_res.DnsEndpointType
-				isHnsEnabled					= $az_res.EnableHierarchicalNamespace
-				supportsHttpsTrafficOnly		= $az_res.EnableHttpsTrafficOnly
-				isLocalUserEnabled				= $az_res.EnableLocalUser
-				isNfsV3Enabled					= $az_res.EnableNfsV3
-				isSftpEnabled					= $az_res.EnableSftp
-				# = $az_res.Encryption
-				# = $az_res.ExtendedLocation
-				# = $az_res.ExtendedProperties
-				# FailoverInProgress
-				# GeoReplicationStats
-				# identity
-				# = $az_res.ImmutableStorageWithVersioning
-				# KeyCreationTime
+			apiVersion			= '2026-04-01'
+			placement			= convertTo-String $az_res.ZonePlacementPolicy
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+			identity			= get-identity $az_res
+			kind				= convertTo-String $az_res.Kind
+			sku 				= @{ name = $az_res.Sku.Name }
+			
+			properties = @{
+				accessTier						= convertTo-String $az_res.AccessTier
+				allowBlobPublicAccess			= convertTo-Boolean $az_res.AllowBlobPublicAccess
+				allowCrossTenantReplication		= convertTo-Boolean $az_res.AllowCrossTenantReplication
+				allowedCopyScope				= convertTo-String $az_res.AllowedCopyScope
+				allowSharedKeyAccess			= convertTo-Boolean $az_res.AllowSharedKeyAccess
+				# allowSharedKeyAccessForServices
+				azureFilesIdentityBasedAuthentication = $azureFilesIdentityBasedAuthentication
+				# customDomain
+				# dataCollaborationPolicyProperties
+				# defaultToOAuthAuthentication
+				dnsEndpointType					= convertTo-String $az_res.DnsEndpointType
+				# dualStackEndpointPreference
+				# enableExtendedGroups
+				# encryption
+				# geoPriorityReplicationStatus
+				# immutableStorageWithVersioning
+				isHnsEnabled					= convertTo-Boolean $az_res.EnableHierarchicalNamespace
+				isLocalUserEnabled				= convertTo-Boolean $az_res.EnableLocalUser
+				isNfsV3Enabled					= convertTo-Boolean $az_res.EnableNfsV3
+				isSftpEnabled					= convertTo-Boolean $az_res.EnableSftp
 				keyPolicy = @{
-					keyExpirationPeriodInDays	= $az_res.KeyPolicy.KeyExpirationPeriodInDays
+					keyExpirationPeriodInDays	= $az_res.KeyPolicy.KeyExpirationPeriodInDays # [int]
 				}
-				largeFileSharesState			= $az_res.LargeFileSharesState
-				# LastGeoFailoverTime
-				minimumTlsVersion				= $az_res.MinimumTlsVersion
+				largeFileSharesState			= convertTo-String $az_res.LargeFileSharesState
+				minimumTlsVersion				= convertTo-String $az_res.MinimumTlsVersion
 				networkAcls 					= $networkAcls
-				# PrimaryEndpoints
-				# PrimaryLocation
-				# ProvisioningState
-				publicNetworkAccess				= $az_res.PublicNetworkAccess
-				# ResourceGroupName
+				publicNetworkAccess				= convertTo-String $az_res.PublicNetworkAccess
 				routingPreference = @{
-					publishInternetEndpoints	= $az_res.RoutingPreference.PublishInternetEndpoints
-					publishMicrosoftEndpoints	= $az_res.RoutingPreference.PublishMicrosoftEndpoints
-					routingChoice				= $az_res.RoutingPreference.RoutingChoice
+					publishInternetEndpoints	= convertTo-Boolean $az_res.RoutingPreference.PublishInternetEndpoints
+					publishMicrosoftEndpoints	= convertTo-Boolean $az_res.RoutingPreference.PublishMicrosoftEndpoints
+					routingChoice				= convertTo-String $az_res.RoutingPreference.RoutingChoice
 				}
-				# = $az_res.SasPolicy
-				# SecondaryEndpoints
-				# SecondaryLocation
-				# StatusOfPrimary
-				# StatusOfSecondary
-				# StorageAccountSkuConversionStatus
+				# sasPolicy
+				supportsHttpsTrafficOnly		= convertTo-Boolean $az_res.EnableHttpsTrafficOnly
 			}
 		}
+		add-resourcesALL $resource $az_res -resName $az_res.StorageAccountName
 
-		add-resourcesALL $resource  $az_res  $az_res.StorageAccountName
+		test-property -unknownProperty 'allowSharedKeyAccessForServices'
+		test-property 'customDomain' $az_res.CustomDomain
+		test-property -unknownProperty 'dataCollaborationPolicyProperties'
+		test-property -unknownProperty 'defaultToOAuthAuthentication'
+		test-property -unknownProperty 'dualStackEndpointPreference'
+		test-property -unknownProperty 'enableExtendedGroups'
+		test-property 'encryption' $az_res.Encryption
+		test-property -displayProperty 'geoPriorityReplicationStatus' $az_res.GeoPriorityReplicationStatus
+		test-property 'immutableStorageWithVersioning' $az_res.ImmutableStorageWithVersioning
+		test-property 'sasPolicy' $az_res.SasPolicy
 	}
 
 	#-------------------------------------------------------------
 	# child resource fileServices
 	foreach ($az_res in $script:az_storageAccountsFileService) {
+
+		$parentName = $az_res.StorageAccountName
+		#========================================
+		$script:testResourceName = $parentName
+		$script:testResourceType = 'saFileService'
+		#========================================
+
 		$resource = @{
-			type 				= 'Microsoft.Storage/storageAccounts/fileServices'
-			apiVersion			= '2024-01-01'
-			properties			= @{
+			type 		= 'Microsoft.Storage/storageAccounts/fileServices'
+			apiVersion	= '2026-04-01'
+			parent 		= "<$(get-bicepNameByType 'Microsoft.Storage/storageAccounts' $parentName)>"
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+			properties	= @{
 				# cors
 				protocolSettings = @{
+					# nfs
 					smb = @{
-						authenticationMethods		= $az_res.ProtocolSettings.Smb.AuthenticationMethods
-						channelEncryption			= $az_res.ProtocolSettings.Smb.ChannelEncryption
-						kerberosTicketEncryption	= $az_res.ProtocolSettings.Smb.ChannelEncryption
+						authenticationMethods		= convertTo-String $az_res.ProtocolSettings.Smb.AuthenticationMethods -separator ';'
+						channelEncryption			= convertTo-String $az_res.ProtocolSettings.Smb.ChannelEncryption -separator ';'
+						# encryptionInTransit
+						kerberosTicketEncryption	= convertTo-String $az_res.ProtocolSettings.Smb.KerberosTicketEncryption -separator ';'
 						multichannel = @{
-							enabled					= $az_res.ProtocolSettings.Smb.Multichannel.Enabled
+							enabled					= convertTo-Boolean $az_res.ProtocolSettings.Smb.Multichannel.Enabled
 						}
-						versions					= $az_res.ProtocolSettings.Smb.Versions
+						versions					= convertTo-String $az_res.ProtocolSettings.Smb.Versions -separator ';'
 					}
 				}
 				shareDeleteRetentionPolicy = @{
-					allowPermanentDelete			= $az_res.ShareDeleteRetentionPolicy.AllowPermanentDelete
-					days							= $az_res.ShareDeleteRetentionPolicy.Days
-					enabled							= $az_res.ShareDeleteRetentionPolicy.Enabled
+					allowPermanentDelete			= convertTo-Boolean $az_res.ShareDeleteRetentionPolicy.AllowPermanentDelete
+					days							= $az_res.ShareDeleteRetentionPolicy.Days # [int]
+					enabled							= convertTo-Boolean $az_res.ShareDeleteRetentionPolicy.Enabled
 				}
 			}
 		}
 
-		$parentName = $az_res.StorageAccountName
-		$resource.parent = "<$(get-bicepNameByType 'Microsoft.Storage/storageAccounts' $parentName)>"
-		$resName = "$parentName/$($az_res.Name)"
-
 		# name of fileServices = name of storageAccounts for BICEP
-		add-resourcesALL $resource $az_res $resName -noRegion
+		add-resourcesALL $resource $az_res -resName "$parentName/$($az_res.Name)" -noRegion
+
+		test-property 'cors' $az_res.Cors
+		test-property 'nfs' $az_res.ProtocolSettings.Nfs
+		test-property 'smb.encryptionInTransit' $az_res.ProtocolSettings.Smb.EncryptionInTransit
 	}
 
 	#-------------------------------------------------------------
 	# child resource blobServices
 	foreach ($az_res in $script:az_storageAccountsBlobService) {
 
+		$parentName = $az_res.StorageAccountName
+		#========================================
+		$script:testResourceName = $parentName
+		$script:testResourceType = 'saBlobService'
+		#========================================
+
 		$resource = @{
-			type 				= 'Microsoft.Storage/storageAccounts/blobServices'
-			apiVersion			= '2024-01-01'
-			properties			= @{
-				# automaticSnapshotPolicyEnabled 
+			type 		= 'Microsoft.Storage/storageAccounts/blobServices'
+			apiVersion	= '2026-04-01'
+			parent 		= "<$(get-bicepNameByType 'Microsoft.Storage/storageAccounts' $parentName)>"
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+			properties	= @{
+				# automaticSnapshotPolicyEnabled 	# Deprecated 
 				changeFeed = @{
-					enabled							= $az_res.ChangeFeed.Enabled
-					retentionInDays					= $az_res.ChangeFeed.RetentionInDays
+					enabled							= convertTo-Boolean $az_res.ChangeFeed.Enabled
+					retentionInDays					= $az_res.ChangeFeed.RetentionInDays # [int]
 				}
 				containerDeleteRetentionPolicy = @{
-					allowPermanentDelete			= $az_res.ContainerDeleteRetentionPolicy.AllowPermanentDelete
-					days							= $az_res.ContainerDeleteRetentionPolicy.Days
-					enabled							= $az_res.ContainerDeleteRetentionPolicy.Enabled
+					allowPermanentDelete			= convertTo-Boolean $az_res.ContainerDeleteRetentionPolicy.AllowPermanentDelete
+					days							= $az_res.ContainerDeleteRetentionPolicy.Days # [int]
+					enabled							= convertTo-Boolean $az_res.ContainerDeleteRetentionPolicy.Enabled
 				}
 				# cors
-				defaultServiceVersion				= $az_res.DefaultServiceVersion
+				defaultServiceVersion				= convertTo-String $az_res.DefaultServiceVersion
 				deleteRetentionPolicy = @{
-					allowPermanentDelete			= $az_res.DeleteRetentionPolicy.AllowPermanentDelete
-					days							= $az_res.DeleteRetentionPolicy.Days
-					enabled							= $az_res.DeleteRetentionPolicy.Enabled
+					allowPermanentDelete			= convertTo-Boolean $az_res.DeleteRetentionPolicy.AllowPermanentDelete
+					days							= $az_res.DeleteRetentionPolicy.Days # [int]
+					enabled							= convertTo-Boolean $az_res.DeleteRetentionPolicy.Enabled
 				}
-				isVersioningEnabled					= $az_res.IsVersioningEnabled
+				isVersioningEnabled					= convertTo-Boolean $az_res.IsVersioningEnabled
 				lastAccessTimeTrackingPolicy = @{
-					blobType						= $az_res.LastAccessTimeTrackingPolicy.BlobType
-					enable							= $az_res.LastAccessTimeTrackingPolicy.Enable
-					name							= $az_res.LastAccessTimeTrackingPolicy.Name
-					trackingGranularityInDays		= $az_res.LastAccessTimeTrackingPolicy.TrackingGranularityInDays
+					blobType						= convertTo-array $az_res.LastAccessTimeTrackingPolicy.BlobType
+					enable							= convertTo-Boolean $az_res.LastAccessTimeTrackingPolicy.Enable
+					name							= convertTo-String $az_res.LastAccessTimeTrackingPolicy.Name
+					trackingGranularityInDays		= $az_res.LastAccessTimeTrackingPolicy.TrackingGranularityInDays # [int]
 				}
 				restorePolicy = @{
-					days							= $az_res.RestorePolicy.Days
-					enabled							= $az_res.RestorePolicy.Enabled
+					days							= $az_res.RestorePolicy.Days # [int]
+					enabled							= convertTo-Boolean $az_res.RestorePolicy.Enabled
 				}
+				# staticWebsite
 			}
 		}
 
-		$parentName = $az_res.StorageAccountName
-		$resource.parent = "<$(get-bicepNameByType 'Microsoft.Storage/storageAccounts' $parentName)>"
-		$resName = "$parentName/$($az_res.Name)"
-
 		# name of blobServices = name of storageAccounts for BICEP
-		add-resourcesALL $resource $az_res $resName -noRegion
+		add-resourcesALL $resource $az_res -resName "$parentName/$($az_res.Name)" -noRegion
+
+		test-property 'cors' $az_res.Cors
+		test-property -unknownProperty 'staticWebsite'
 	}
 
 	#-------------------------------------------------------------
 	# child resource container
 	foreach ($az_res in $script:az_storageContainers) {
 
+		# container not copied
 		if ($az_res.Deleted -eq $true) {
 			continue
-		}	
-
-		$resource = @{
-			type 				= 'Microsoft.Storage/storageAccounts/blobServices/containers'
-			apiVersion			= '2024-01-01'
-			properties			= @{
-				defaultEncryptionScope		= $az_res.DefaultEncryptionScope
-				denyEncryptionScopeOverride	= $az_res.DenyEncryptionScopeOverride
-				enableNfsV3AllSquash		= $az_res.EnableNfsV3AllSquash
-				enableNfsV3RootSquash		= $az_res.EnableNfsV3RootSquash
-				immutableStorageWithVersioning = @{
-					enabled					= $az_res.ImmutableStorageWithVersioning.Enabled
-				}
-				# metadata 					= $az_res.Metadata
-				publicAccess				= $az_res.PublicAccess -as [string]
-			}
 		}
 
 		# get resource name of blobServices (only one blob service allowed per storage account)
 		$parentName = ($script:bicepNamesAll.values
 					| Where-Object type -eq 'Microsoft.Storage/storageAccounts/blobServices'
 					| Where-Object name -like "$($az_res.StorageAccountName)/*").name
-		
-		$resource.parent = "<$(get-bicepNameByType 'Microsoft.Storage/storageAccounts/blobServices' $parentName)>"
-		$resName = "$parentName/$($az_res.Name)"
 
-		add-resourcesALL $resource $az_res $resName -noRegion
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'saBlobContainer'
+		#========================================
+
+
+		$resource = @{
+			type 		= 'Microsoft.Storage/storageAccounts/blobServices/containers'
+			apiVersion	= '2026-04-01'
+			parent 		= "<$(get-bicepNameByType 'Microsoft.Storage/storageAccounts/blobServices' $parentName)>"
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+			properties			= @{
+				defaultEncryptionScope		= convertTo-String $az_res.DefaultEncryptionScope
+				denyEncryptionScopeOverride	= convertTo-Boolean $az_res.DenyEncryptionScopeOverride
+				enableNfsV3AllSquash		= convertTo-Boolean $az_res.EnableNfsV3AllSquash
+				enableNfsV3RootSquash		= convertTo-Boolean $az_res.EnableNfsV3RootSquash
+				immutableStorageWithVersioning = @{
+					enabled					= convertTo-Boolean $az_res.ImmutableStorageWithVersioning.Enabled
+				}
+				# metadata
+				publicAccess				= convertTo-String $az_res.PublicAccess
+			}
+		}
+		add-resourcesALL $resource $az_res -resName "$parentName/$($az_res.Name)" -noRegion
+
+		test-property 'metadata' $az_res.Metadata
 	}
 
 	#-------------------------------------------------------------
 	# child resource share
 	foreach ($az_res in $script:az_storageShares) {
 
+		# do not copy snapshots
 		if ($null -ne $az_res.SnapshotTime) {
 			continue
 		}
 
+		# share not copied
 		if ($az_res.Deleted -eq $true) {
 			continue
-		}	
-
-		$resource = @{
-			type 				= 'Microsoft.Storage/storageAccounts/fileServices/shares'
-			apiVersion			= '2024-01-01'
-			properties = @{
-				accessTier				= $az_res.AccessTier
-				enabledProtocols		= $az_res.EnabledProtocols -as [string]
-				fileSharePaidBursting	= @{
-					paidBurstingEnabled				= $az_res.FileSharePaidBursting.PaidBurstingEnabled
-					paidBurstingMaxBandwidthMibps	= $az_res.FileSharePaidBursting.PaidBurstingMaxBandwidthMibps
-					paidBurstingMaxIop				= $az_res.FileSharePaidBursting.PaidBurstingMaxIops
-				}
-				# metadata
-				rootSquash				= $az_res.RootSquash
-				shareQuota				= $az_res.QuotaGiB
-				# signedIdentifiers
-			}
 		}
 
 		# get resource name of blobServices (only one blob service allowed per storage account)
 		$parentName = ($script:bicepNamesAll.values
 					| Where-Object type -eq 'Microsoft.Storage/storageAccounts/fileServices'
 					| Where-Object name -like "$($az_res.StorageAccountName)/*").name
-		
-		$resource.parent = "<$(get-bicepNameByType 'Microsoft.Storage/storageAccounts/fileServices' $parentName)>"
-		$resName = "$parentName/$($az_res.Name)"
 
-		add-resourcesALL $resource $az_res $resName -noRegion
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'saFileShare'
+		#========================================	
+
+		$resource = @{
+			type 		= 'Microsoft.Storage/storageAccounts/fileServices/shares'
+			apiVersion	= '2026-04-01'
+			parent 		= "<$(get-bicepNameByType 'Microsoft.Storage/storageAccounts/fileServices' $parentName)>"
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+			properties = @{
+				accessTier					= convertTo-String $az_res.AccessTier
+				enabledProtocols			= convertTo-String $az_res.EnabledProtocols
+				fileSharePaidBursting	= @{
+					paidBurstingEnabled				= convertTo-Boolean $az_res.FileSharePaidBursting.PaidBurstingEnabled
+					paidBurstingMaxBandwidthMibps	= $az_res.FileSharePaidBursting.PaidBurstingMaxBandwidthMibps # [int]
+					paidBurstingMaxIop				= $az_res.FileSharePaidBursting.PaidBurstingMaxIops # [int]
+				}
+				# metadata
+				provisionedBandwidthMibps	= $az_res.ProvisionedBandwidthMibps # [int]
+				provisionedIops				= $az_res.ProvisionedIops # [int]
+				rootSquash					= convertTo-String $az_res.RootSquash
+				shareQuota					= $az_res.QuotaGiB # [int]
+				# signedIdentifiers
+			}
+		}
+		add-resourcesALL $resource $az_res -resName "$parentName/$($az_res.Name)" -noRegion
+
+		test-property 'metadata' $az_res.Metadata
+		test-property -unknownProperty 'signedIdentifiers'
+	}
+}
+
+#--------------------------------------------------------------
+function add-az_privateEndpoints {
+#--------------------------------------------------------------
+	foreach ($az_res in $script:az_privateEndpoints) {
+
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'endpoint'
+		#========================================
+
+		#--------------------------------------------------------------
+		$applicationSecurityGroups = @()
+		foreach ($item in $az_res.ApplicationSecurityGroups) {
+			$applicationSecurityGroups += get-bicepReference $item.Id
+		}
+
+		#--------------------------------------------------------------
+		$privateLinkServiceConnections = @()
+		foreach ($item in $az_res.PrivateLinkServiceConnections) {
+
+			# get service ID, e.g. /subscriptions/../storageAccounts/saNameOld
+			$privateLinkServiceId = $item.PrivateLinkServiceId
+
+			# replace service ID if it is a copied storage account
+			$r = get-resourceComponents $privateLinkServiceId
+			if ($r.subscriptionID -eq $sourceSubID) {
+				if ($r.resourceGroup -eq $sourceRG) {
+					if ($r.mainResourceType -eq 'storageAccounts') {
+	
+						$oldName = $script:copySA[$r.mainResourceName].oldName
+						if ($null -ne $oldName) {
+							# old bicep name for saNameNew
+							$privateLinkServiceId = "<$(get-bicepNameByType 'Microsoft.Storage/storageAccounts' $oldName).id>"
+						}
+					}
+				}
+			}
+
+			# get groupIds
+			$groupIds = @()
+			foreach ($groupID in $item.GroupIds) {
+				$groupIds += $groupID
+			}
+
+			# add privateLinkServiceConnection
+			$privateLinkServiceConnections += @{
+				name = $item.Name
+				properties = @{
+					groupIds = $groupIds
+					privateLinkServiceId = $privateLinkServiceId
+				}
+			}
+		}
+
+		#--------------------------------------------------------------
+		$customDnsConfigs = @()
+		foreach ($item in $az_res.CustomDnsConfigs) {
+
+			# get fqdn
+			$fqdn = $item.Fqdn
+			if ($null -ne $item.Fqdn) {		
+				$s = $fqdn -split '\.'
+				$oldName = $s[0]
+
+				# change fqdn
+				$newName = $script:copySA[$oldName].newName
+				if ($null -ne $newName) {
+					$s[0] = $newName
+					$fqdn = $s -join '.'
+				}
+			}
+
+			# get IpAddresses
+			$IpAddresses = @()
+			foreach ($addr in $item.IpAddresses) {
+				$IpAddresses += $addr
+			}
+
+			# add customDnsConfig
+			$customDnsConfigs += @{
+				fqdn		= $fqdn
+				ipAddresses = $IpAddresses
+			}
+		}
+
+		#--------------------------------------------------------------
+		$ipConfigurations = @()
+		# get first NIC
+		$id = $az_res.NetworkInterfaces[0].Id
+		$az_nic = $script:az_networkInterfaces | Where-Object Id -eq $id
+
+		$i = 0
+		foreach ($conf in $az_nic.IpConfigurations) {
+			$i++
+			$groupId 	= convertTo-String $conf.PrivateLinkConnectionProperties.GroupId
+			$memberName = convertTo-String $conf.PrivateLinkConnectionProperties.RequiredMemberName
+
+			# add ipConfiguration
+			$ipConfigurations += @{
+				name = "$memberName$i" # create new, unique name
+				properties = @{
+					privateIPAddress	= convertTo-String $conf.PrivateIpAddress
+					memberName			= $groupId 
+					groupId				= $groupId 
+				}
+			}
+		}
+
+		#--------------------------------------------------------------
+		# subnet
+		$dependsOn = @()
+		$subnet = get-bicepReference $az_res.Subnet.Id ([ref] $dependsOn)
+		
+		#--------------------------------------------------------------
+		# create resource
+		$resource = @{
+			type 		= 'Microsoft.Network/privateEndpoints'
+			apiVersion	= '2025-05-01'
+			dependsOn	= $dependsOn
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+			properties	= @{
+				applicationSecurityGroups		= $applicationSecurityGroups
+				customDnsConfigs				= $customDnsConfigs
+				customNetworkInterfaceName		= ('privateEndpoint.' + (New-Guid).Guid) # create new, unique name
+				ipConfigurations				= $ipConfigurations
+				ipVersionType					= convertTo-String $az_res.IpVersionType
+				# manualPrivateLinkServiceConnections
+				privateLinkServiceConnections	= $privateLinkServiceConnections
+				subnet = $subnet
+			}
+		}
+		test-property 'manualPrivateLinkServiceConnections' $az_res.ManualPrivateLinkServiceConnections
+
+		add-resourcesALL $resource $az_res
+
+		#--------------------------------------------------------------
+		# sub-resource privateDnsZoneGroups
+		$endpointId 		= $az_res.Id
+		$endPointName		= $az_res.Name
+		$privateDnsZones	= @( $script:az_privateDnsZones | Where-Object Id -like "$endpointId/*" )
+
+		foreach ($az_resDns in $privateDnsZones) {
+			# create resource
+			$resource = @{
+				type 		= 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups'
+				apiVersion	= '2025-05-01'
+				dependsOn	= @( "<$(get-bicepNameByType 'Microsoft.Network/privateEndpoints' $endPointName)>" )
+				# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+				properties	= @{
+					privateDnsZoneId = get-bicepReference $az_resDns.PrivateDnsZoneId
+				}
+			}
+	
+			add-resourcesALL $resource $az_resDns -resName "$endPointName/$($az_resDns.Name)"
+		}
+	}
+}
+
+#--------------------------------------------------------------
+function add-az_dnsZones {
+#--------------------------------------------------------------
+	foreach ($az_res in $script:az_dnsZones) {
+
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'dnsZone'
+		#========================================
+
+		$registrationVirtualNetworks = @()
+		foreach ($item in $az_res.RegistrationVirtualNetworkIds) {
+			$registrationVirtualNetworks += get-bicepReference $item
+		}
+		
+		$resolutionVirtualNetworks = @()
+		foreach ($item in $az_res.ResolutionVirtualNetworkIds) {
+			$resolutionVirtualNetworks += get-bicepReference $item
+		}
+
+		$resource = @{
+			type		= 'Microsoft.Network/dnsZones'
+			apiVersion	= '2018-05-01'
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+			properties	= @{
+				registrationVirtualNetworks = $registrationVirtualNetworks
+				resolutionVirtualNetworks	= $resolutionVirtualNetworks
+				zoneType					= convertTo-String $az_res.ZoneType
+			}
+		}
+		add-resourcesALL $resource $az_res
+	}
+
+	#--------------------------------------------------------------
+	# dnsRecordSets
+	foreach ($az_res in $script:az_dnsRecordSets) {
+
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'dnsZoneRS'
+		#========================================
+		$recordType = convertTo-String $az_res.RecordType
+		$parentName = convertTo-String $az_res.ZoneName
+	
+		# metadata
+		$metadata = @{}
+		foreach ($key in $az_res.Metadata.Keys) {
+			$metadata.$key = remove-angleBrackets $az_res.Metadata.$key
+		}
+
+		$resource = @{
+			type		= "Microsoft.Network/dnsZones/$recordType"
+			apiVersion	= '2018-05-01'
+			parent 		= "<$(get-bicepNameByType 'Microsoft.Network/dnsZones' $parentName)>"
+			properties	= @{
+				metadata			= $metadata
+				TTL					= $az_res.Ttl	# [int]
+				targetResource		= get-bicepReference $az_res.TargetResourceId -allowSubresource
+				# ARecords		# set by add-az_dnsRecords
+				# AAAARecords	# set by add-az_dnsRecords
+				# caaRecords	# set by add-az_dnsRecords
+				# CNAMERecord	# set by add-az_dnsRecords
+				# dnssecConfigs
+				# DS
+				# MXRecords		# set by add-az_dnsRecords
+				# NAPTRRecords
+				# NSRecords		# set by add-az_dnsRecords
+				# PTRRecords	# set by add-az_dnsRecords
+				# SOARecord		# set by add-az_dnsRecords
+				# SRVRecords	# set by add-az_dnsRecords
+				# TLSA
+				# TXTRecords	# set by add-az_dnsRecords
+			}
+		}
+
+		# The provided nameservers in a record set of type 'NS' with name '@' cannot be modified or removed.
+		if (($recordType -ne 'NS') -or ($az_res.Name -ne '@')) {
+
+			$success = add-az_dnsRecords ([ref] $az_res.Records) $recordType $resource.properties
+			if ($success) {
+				add-resourcesALL $resource $az_res -bicepResName "$parentName/$($az_res.Name)" -noRegion
+			}
+		}
+	}
+}
+
+#--------------------------------------------------------------
+function add-az_dnsRecords {
+#--------------------------------------------------------------
+	param (
+		[ref] $ref,			# ([ref] $az_res.Records)
+		$recordType,
+		$properties,		# $resource.properties (reference, since this is a hash table)
+		[switch] $private
+	)
+
+	$records = @()
+	switch ($recordType) {
+		#--------------------------------------------------------------
+		'A' {
+			foreach ($item in $ref.Value) {
+				$records += @{
+					ipv4Address = $item.Ipv4Address
+				}
+			}
+			if ($private) {
+				$properties.aRecords = $records
+			}
+			else {
+				$properties.ARecords = $records
+			}
+		}
+
+		#--------------------------------------------------------------
+		'AAAA' {
+			foreach ($item in $ref.Value) {
+				$records += @{
+					ipv6Address = $item.Ipv6Address
+				}
+			}
+			if ($private) {
+				$properties.aaaaRecords = $records
+			}
+			else {
+				$properties.AAAARecords = $records
+
+			}	
+		}
+
+		#--------------------------------------------------------------
+		'CAA' {
+			foreach ($item in $ref.Value) {
+				$records += @{
+					flags = $item.Flags
+					tag   = $item.Tag
+					value = $item.Value
+				}
+			}
+			if ($private) {
+				# does not exist
+				write-logFileWarning "DNS entry '$recordType' set in source RG but skipped by RGCOPY"
+				return $false
+			}
+			else {
+				$properties.caaRecords = $records
+			}	
+		}
+
+		#--------------------------------------------------------------
+		'CNAME' {
+			$records = $ref.Value.Cname
+			if ($private) {
+				$properties.cnameRecord = @{
+					cname = $records
+				}
+			}
+			else {
+				$properties.CNAMERecord = @{
+					cname = $records
+				}	
+			}
+		}
+
+		#--------------------------------------------------------------
+		'dnssecConfigs' {
+			write-logFileWarning "DNS entry '$recordType' set in source RG but skipped by RGCOPY"
+			return $false
+		}
+
+		#--------------------------------------------------------------
+		'DS' {
+			write-logFileWarning "DNS entry '$recordType' set in source RG but skipped by RGCOPY"
+			return $false
+		}
+
+		#--------------------------------------------------------------
+		'MX' {
+			foreach ($item in $ref.Value) {
+				$records += @{
+					exchange 	= $item.Exchange
+					preference	= $item.Preference
+				}
+			}
+			if ($private) {
+				$properties.mxRecords = $records
+			}
+			else {
+				$properties.MXRecords = $records
+			}
+		}
+
+		#--------------------------------------------------------------
+		'NAPTR' {
+			write-logFileWarning "DNS entry '$recordType' set in source RG but skipped by RGCOPY"
+			return $false
+		}
+
+		#--------------------------------------------------------------
+		'NS' {
+			foreach ($item in $ref.Value) {
+				$records += @{
+					nsdname 	= $item.Nsdname
+				}
+			}
+			if ($private) {
+				# does not exist
+				write-logFileWarning "DNS entry '$recordType' set in source RG but skipped by RGCOPY"
+				return $false
+			}
+			else {
+				$properties.NSRecords = $records
+			}
+		}
+
+		#--------------------------------------------------------------
+		'PTR' {
+			foreach ($item in $ref.Value) {
+				$records += @{
+					ptrdname 	= $item.Ptrdname
+				}
+			}
+			if ($private) {
+				$properties.ptrRecords = $records
+			}
+			else {
+				$properties.PTRRecords = $records
+			}
+		}
+
+		#--------------------------------------------------------------
+		'SOA' {
+			$records = @{
+				email			= $ref.Value.Email
+				expireTime		= $ref.Value.ExpireTime
+				host			= $ref.Value.Host
+				minimumTtl		= $ref.Value.MinimumTtl
+				refreshTime		= $ref.Value.RefreshTime
+				retryTime		= $ref.Value.RetryTime
+				serialNumber	= $ref.Value.SerialNumber
+			}
+			if ($private) {
+				$properties.soaRecord = $records
+			}
+			else {
+				$properties.SOARecord = $records
+			}
+		}
+
+		#--------------------------------------------------------------
+		'SRV' {
+			foreach ($item in $ref.Value) {
+				$records += @{
+					port 		= $item.Port
+					priority 	= $item.Priority
+					target 		= $item.Target
+					weight 		= $item.Weight
+				}
+			}
+			if ($private) {
+				$properties.srvRecords = $records
+			}
+			else {
+				$properties.SRVRecords = $records
+			}
+		}
+
+		#--------------------------------------------------------------
+		'TLSA' {
+			write-logFileWarning "DNS entry '$recordType' set in source RG but skipped by RGCOPY"
+			return $false
+		}
+
+		#--------------------------------------------------------------
+		'TXT' {
+			foreach ($item in $ref.Value) {
+				$strings = @()
+				foreach ($string in $item.Value) {
+					$strings += $string
+				}
+				$records += @{
+					value 		= $strings
+				}
+			}
+			if ($private) {
+				$properties.txtRecords = $records
+			}
+			else {
+				$properties.TXTRecords = $records
+			}	
+		}
+
+		#--------------------------------------------------------------
+		Default {
+			write-logFileWarning "DNS entry '$recordType' set in source RG but skipped by RGCOPY"
+			return $false
+		}
+	}
+	return $true
+}
+
+#--------------------------------------------------------------
+function add-az_privateDnsZones {
+#--------------------------------------------------------------
+	# privateDnsZones
+	foreach ($az_res in $script:az_privateDnsZones) {
+
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'privDnsZone'
+		#========================================
+
+		$resource = @{
+			type		= 'Microsoft.Network/privateDnsZones'
+			apiVersion	= '2024-06-01'
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+			properties	= @{}
+		}
+		add-resourcesALL $resource $az_res -regionGlobal
+	}
+
+	#--------------------------------------------------------------
+	# privateDnsRecordSets
+	foreach ($az_res in $script:az_privateDnsRecordSets) {
+
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'privDnsZoneRS'
+		#========================================
+		$recordType = convertTo-String $az_res.RecordType
+		$parentName = convertTo-String $az_res.ZoneName
+
+		# metadata
+		$metadata = @{}
+		foreach ($key in $az_res.Metadata.Keys) {
+			$metadata.$key = remove-angleBrackets $az_res.Metadata.$key
+		}
+
+		$resource = @{
+			type		= "Microsoft.Network/privateDnsZones/$recordType"
+			apiVersion	= '2024-06-01'
+			parent 		= "<$(get-bicepNameByType 'Microsoft.Network/privateDnsZones' $parentName)>"
+			properties	= @{
+				metadata		= $metadata
+				ttl				= $az_res.Ttl	# [int]
+				# aRecords		# set by add-az_dnsRecords
+				# aaaaRecords	# set by add-az_dnsRecords
+				# cnameRecord	# set by add-az_dnsRecords
+				# mxRecords		# set by add-az_dnsRecords
+				# ptrRecords	# set by add-az_dnsRecords
+				# soaRecord		# set by add-az_dnsRecords
+				# srvRecords	# set by add-az_dnsRecords
+				# txtRecords	# set by add-az_dnsRecords
+			}
+		}
+
+		# The provided nameservers in a record set of type 'NS' with name '@' cannot be modified or removed.
+		if (($recordType -ne 'NS') -or ($az_res.Name -ne '@')) {
+			
+			$success = add-az_dnsRecords ([ref] $az_res.Records) $recordType $resource.properties -private
+			if ($success) {
+				add-resourcesALL $resource $az_res -bicepResName "$parentName/$($az_res.Name)" -noRegion
+			}
+		}
+	}
+
+	#--------------------------------------------------------------
+	# virtualNetworkLinks
+	foreach ($az_res in $script:az_privateDnsVirtualNetworkLinks) {
+
+		#========================================
+		$script:testResourceName = $az_res.Name
+		$script:testResourceType = 'privDnsZoneNwLink'
+		#========================================
+		$parentName = (get-resourceComponents $az_res.ResourceId).mainResourceName
+
+		$resource = @{
+			type		= 'Microsoft.Network/privateDnsZones/virtualNetworkLinks'
+			apiVersion	= '2024-06-01'
+			parent		= "<$(get-bicepNameByType 'Microsoft.Network/privateDnsZones' $parentName)>"
+			# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+
+			properties	= @{
+				registrationEnabled = convertTo-Boolean $az_res.RegistrationEnabled
+				resolutionPolicy	= convertTo-String $az_res.ResolutionPolicy
+				virtualNetwork 		= get-bicepReference $az_res.VirtualNetworkId # not VirtualNetwork.Id !
+			}
+		}
+		add-resourcesALL $resource $az_res -bicepResName "$parentName/$($az_res.Name)" -regionGlobal
 	}
 }
 
@@ -20295,7 +21996,7 @@ function step-armTemplate {
 	if ($useBicep) {
 		write-stepStart "Create BICEP template"
 
-		get-az_local
+		get-az_all
 		new-templateBicep
 	}
 
@@ -20564,6 +22265,7 @@ function new-runningTasks {
 		foreach ($mp in $_.MountPoints) {
 
 			$pathClean = $mp.Path -replace '/', '-'
+			$pathClean = $pathClean -replace '\.\-', '.'
 
 			$script:runningTasks += @{
 				vmName 		= $vmName 
@@ -20887,9 +22589,16 @@ function step-deployment {
 	# deployment of the rest (with or without disks)
 	deploy-templateTarget $exportPath "$sourceRG.$timestampSuffix"
 
+	# if ($dualDeploymentVmExt) {
+	# 	deploy-templateTarget $exportPathVmExt "$sourceRG-VmExt.$timestampSuffix"
+	# }
+
 	#--------------------------------------------------------------
 	if (!$cloneOrMergeMode) {
 		get-targetVMs
+		if ($patchVMsTargetRG) {
+			step-patchOS
+		}
 	}
 
 	#--------------------------------------------------------------
@@ -21211,391 +22920,6 @@ function stop-VMsTargetRG {
 	}
 }
 
-#-------------------------------------------------------------
-function step-patchMode {
-#-------------------------------------------------------------
-	write-stepStart "Patching VMs"
-	get-shellScripts
-
-	if (!$simulate) {
-		start-VMsParallel $sourceRG $patchVMs
-	}
-	
-	foreach ($vmName in $patchVMs) {
-			$osType = $script:copyVMs[$vmName].OsDisk.OsType
-			write-logFile
-			write-logFile (Get-Date -Format 'yyyy-MM-dd HH:mm:ss \U\T\Cz') -ForegroundColor 'DarkGray'
-			write-logfile '----------------------------------------------------------------------'
-			write-logfile "Patch VM '$vmName' ($osType)"
-	
-			if (!$simulate) {
-				if ($script:copyVMs[$vmName].OsDisk.osType -eq 'linux') {
-					new-scriptPatch $vmName -Linux
-				}
-				else {
-					new-scriptPatch $vmName -Windows
-				}
-			}
-	}
-	write-logFile
-
-	if ($patchVMs.count -eq 0) {
-		write-logFileWarning "No VMs to patch"
-	}
-	else {
-		write-logFileWarning "OS patches might still be installing"
-	}
-	write-stepEnd
-}
-
-#--------------------------------------------------------------
-function new-scriptPatch {
-#--------------------------------------------------------------
-	param (
-		$vmName,
-		[switch] $Linux,
-		[switch] $Windows
-	)
-
-	if ($Windows) {
-		invoke-patchScript $sourceRG $vmName $script:WindowsPatchScript 'RunPowerShellScript'
-		
-	}
-
-	elseif ($Linux) {
-		invoke-patchScript $sourceRG $vmName $script:LinuxPatchScript 'RunShellScript'
-	
-		# second try for ZYPPER
-		if ($script:ZYPPER_EXIT_INF_RESTART_NEEDED -eq $True) {
-	
-			write-logfile
-			write-logfile "Waiting 30 seconds on reboot..."
-			write-logfile
-			Start-Sleep -seconds 30
-	
-			invoke-patchScript $sourceRG $vmName $script:LinuxPatchScript 'RunShellScript'
-			$script:ZYPPER_EXIT_INF_RESTART_NEEDED = $False
-		}
-	}
-}
-
-#--------------------------------------------------------------
-function invoke-patchScript {
-#--------------------------------------------------------------
-	param (
-		$resourceGroup,
-		$scriptVm,
-		$scriptText,
-		$commandId = 'RunShellScript'
-	)
-
-	# script parameters
-	$parameter = @{
-		ResourceGroupName 	= $resourceGroup
-		VMName            	= $scriptVM
-		CommandId         	= $commandId
-		ScriptString 		= $scriptText
-		ErrorAction			= 'SilentlyContinue'
-	}
-
-	wait-vmAgent $resourceGroup $scriptVm 'PATCH VM'
-
-	# execute script
-	write-logFile "SCRIPT RUNNING IN VM"
-	Invoke-AzVMRunCommand @parameter
-	| Tee-Object -Variable result
-	| Out-Null
-
-	# check results
-	if ($result.Status -ne 'Succeeded') {
-		write-logFileWarning "Script in VM '$scriptVm' failed" `
-							"Script Status is not 'Succeeded': $($result.Status)"
-		$script:patchesFailed++
-	}
-	else {
-		$messages = $result.Value[0].Message
-		write-logFile $messages -ForegroundColor 'Cyan'
-
-		$script:ZYPPER_EXIT_INF_RESTART_NEEDED = $False
-		if ($messages -like '*zypper exit code: 103*') {
-			$script:ZYPPER_EXIT_INF_RESTART_NEEDED = $True
-		}
-
-		if ($messages -like '*++ exit 1*') {
-			write-logFileWarning "Script in VM '$scriptVm' returned exit code 1"
-			$script:patchesFailed++
-		}
-
-		elseif ($messages -like '*Last script execution didn''t finish*') {
-			write-logFileWarning "Script in VM '$scriptVm' failed"
-			$script:patchesFailed++
-		}
-	}
-}
-
-#--------------------------------------------------------------
-function get-shellScripts {
-#--------------------------------------------------------------
-	# flag: install only security updates
-	$patchSecurity = 1
-	if ($patchAll) {
-		$patchSecurity = 0
-	}
-
-	# flag: patch kernel
-	$patchKernelInteger = 0
-	if ($patchKernel) {
-		$patchKernelInteger = 1
-	}
-
-#--------------------------------------------------------------
-# Windows patches
-#--------------------------------------------------------------
-	$category = ''
-	if (!$patchAll) {
-		$category = " -Category 'Security Updates' "
-	}
-
-	$logDir  = "C:\Packages\Plugins\RGCOPY"
-	$logFile = "C:\Packages\Plugins\RGCOPY\RGCOPY_WindowsUpdate_$(Get-Date -Format 'yyyy-MM-dd_HH-mm-ss')"
-
-	$script:WindowsPatchScript = @"
-New-Item '$logDir' -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
-
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-Install-PackageProvider -Name NuGet -Force *>>'$logFile'
-Install-Module -Name PSWindowsUpdate -Force *>>'$logFile'
-Import-Module PSWindowsUpdate *>>'$logFile'
-
-Get-WUInstallerStatus | Format-Table
-Get-WURebootStatus | Format-Table
-Get-WULastResults | Format-Table
-
-Write-Host 'Last 10 updates:'
-Get-WUHistory -Last 10 | Format-Table
-
-Write-Host 'Starting updates as job and reboot...'
-
-`$string = @'
-	Import-Module PSWindowsUpdate
-	Get-WindowsUpdate -MicrosoftUpdate -Install $category -AcceptAll -AutoReboot *>>'$logFile'
-'@
-
-`$script = [Scriptblock]::Create(`$string)
-Start-Job -ScriptBlock `$script *>>'$logFile'
-"@
-
-#--------------------------------------------------------------
-# Linux patches
-#--------------------------------------------------------------
-# runs as script.sh
-# header file not used. Only parameter patchSecurity is used.
-	$script:LinuxPatchScript = 
-@"
-#!/bin/bash
-patchSecurity=$patchSecurity
-patchKernel=$patchKernelInteger
-
-$prePatchCommand
-`n
-"@ + @'
-suse=`cat /etc/os-release | grep -i suse | wc -l`
-redHat=`cat /etc/os-release | grep -i 'Red Hat' | wc -l`
-ubuntu=`cat /etc/os-release | grep -i Ubuntu | wc -l`
-
-echo "SCRIPT_DIRECTORY='$(pwd)'" 1>&2
-echo "OS_KERNEL_OLD='$(uname -r)'" 1>&2
-echo "$(cat /etc/os-release | grep PRETTY_NAME)" 1>&2
-
-function waitForPatches {
-    isSuse=$1
-	declare -i waited=0
-
-    if [ $isSuse -gt 0 ]; then
-		while [ $(ps -Af | grep zypper | grep -v grep |  wc -l) -gt 0 -a $waited -lt 300 ];
-			do
-			waited+=5
-			echo "waiting $waited seconds for another instance of ZYPPER to finish..."
-			sleep 5
-			done
-    else
-		while [ $(ps -Af | grep yum | grep -v grep | wc -l) -gt 0 -a $waited -lt 300 ];
-			do
-			waited+=5
-			echo "waiting $waited seconds for another instance of YUM to finish..."
-			sleep 5
-			done
-    fi
-}
-
-if [ $suse -gt 0 ]; then
-
-	waitForPatches $suse
-	registercloudguest --force-new
-	waitForPatches $suse
-	zypper --quiet patch-check
-	waitForPatches $suse
-
-	if [ $patchKernel -eq 1 ]; then
-		echo " "
-		echo "========================================="
-		echo "installing kernel update using zypper ..."
-		zypper --non-interactive update --with-interactive --auto-agree-with-licenses kernel-default 1> patch.out
-		exitCode=$?
-		echo "zypper exit code: $exitCode"
-		echo "========================================="
-
-		if [ $exitCode -ne 0 ] && [ $exitCode -lt 100 ]; then
-			cat patch.out
-			echo "++ exit 1"
-			exit 1
-		fi
-	fi
-
-	echo " "
-	echo "========================================="
-	if [ $patchSecurity -eq 1 ]; then
-		echo "installing security patches using zypper ..."
-		zypper --non-interactive --quiet patch --with-interactive --auto-agree-with-licenses --category=security 1> patch.out
-	else
-		echo "installing patches using zypper ..."
-		zypper --non-interactive --quiet patch --with-interactive --auto-agree-with-licenses  1> patch.out
-	fi
-	exitCode=$?
-	echo "zypper exit code: $exitCode"
-	echo "========================================="
-
-	if [ $exitCode -ne 0 ] && [ $exitCode -lt 100 ]; then
-		cat patch.out
-		echo ' '
-		echo 'waiting 120 seconds and retry...'
-		sleep 120
-
-		echo " "
-		echo "========================================="
-		if [ $patchSecurity -eq 1 ]; then
-			echo "installing security patches using zypper ..."
-			zypper --non-interactive patch --with-interactive --auto-agree-with-licenses --category=security 1> patch.out
-		else
-			echo "installing patches using zypper ..."
-			zypper --non-interactive patch --with-interactive --auto-agree-with-licenses  1> patch.out
-		fi
-		exitCode=$?
-		echo "zypper exit code: $exitCode"
-		echo "========================================="
-
-		if [ $exitCode -ne 0 ] && [ $exitCode -lt 100 ]; then
-			cat patch.out
-			echo "++ exit 1"
-			exit 1
-		fi
-	fi
-	echo " "
-
-	waitForPatches $suse
-	zypper --quiet patch-check
-
-
-elif [ $redHat -gt 0 ]; then
-
-	waitForPatches $suse
-	yum update -y --disablerepo='*' --enablerepo='*microsoft*'
-	echo 'exclude=WALinuxAgent*' >>/etc/yum.conf
-	yum updateinfo
-	waitForPatches $suse
-
-	if [ $patchKernel -eq 1 ]; then
-		echo " "
-		echo "========================================="
-		echo "installing kernel update using yum ..."
-		yum -y update kernel 1> patch.out
-		exitCode=$?
-		echo "yum exit code: $exitCode"
-		echo "========================================="
-
-		if [ $exitCode -ne 0 ]; then
-			cat patch.out
-			echo "++ exit 1"
-			exit 1
-		fi
-	fi
-
-	echo " "
-	echo "========================================="
-	if [ $patchSecurity -eq 1 ]; then
-		echo "installing security patches using yum ..."
-		yum -y update --security 1> patch.out
-	else
-		echo "installing patches using yum ..."
-		yum -y update 1> patch.out
-	fi
-	exitCode=$?
-	echo "yum exit code: $exitCode"
-	echo "========================================="
-
-	if [ $exitCode -ne 0 ]; then
-		cat patch.out
-		echo ' '
-		echo 'waiting 120 seconds and retry...'
-		sleep 120
-
-		echo ' '
-		echo "========================================="
-		if [ $patchSecurity -eq 1 ]; then
-			echo "installing security patches using yum ..."
-			yum -y update --security 1> patch.out
-		else
-			echo "installing patches using yum ..."
-			yum -y update 1> patch.out
-		fi
-		exitCode=$?
-		echo "yum exit code: $exitCode"
-		echo "========================================="
-
-		if [ $exitCode -ne 0 ]; then
-			cat patch.out
-			echo "++ exit 1"
-			exit 1
-		fi
-		echo " "
-	fi
-	echo " "
-
-	waitForPatches $suse
-	yum updateinfo
-	yum list kernel
-
-
-elif [ $ubuntu -gt 0 ]; then
-
-	apt-get update 1>/dev/null 2>/dev/null
-	apt list --upgradable 2>/dev/null | grep "\-security"
-
-	echo " "
-	echo "========================================="
-	echo "installing security patches using unattended-upgrade ..."
-	unattended-upgrade
-
-	exitCode=$?
-	echo "unattended-upgrade exit code: $exitCode"
-	echo "========================================="
-
-	echo " "
-	apt list --upgradable 2>/dev/null | grep "\-security"
-
-
-else
-	echo "No supported Linux distribution found"
-	echo "No updates are installed"
-fi
-
-echo " "
-echo "wait 10 seconds and reboot VM..."
-(sleep 10; reboot) &
-'@ + "`n`n"
-}
-
-
 #--------------------------------------------------------------
 function get-azcopyVersion {
 #--------------------------------------------------------------
@@ -21801,6 +23125,7 @@ function new-vmExtension {
 		$publisher,
 		$handlerVersion,
 		$settings,
+		$provisionAfter,
 		[switch] $autoUpgradePossible
 	)
 
@@ -21825,10 +23150,13 @@ function new-vmExtension {
 		autoUpgradeMinorVersion = $True
 	}
 
+	if ($ignoreExtensionErrors) {
+		$properties.suppressFailures = $true
+	}
+
 	if ($Null -ne $settings) {
 		$properties.settings = $settings
 	}
-
 
 	if ($autoUpgradePossible -and $autoUpgradeExtensions) {
 		$properties.enableAutomaticUpgrade = $True
@@ -21837,15 +23165,30 @@ function new-vmExtension {
 	# extension
 	$res = @{
 		type 		= 'Microsoft.Compute/virtualMachines/extensions'
-		apiVersion	= '2023-09-01'
+		apiVersion	= '2025-04-01'
 		name 		= $agentName
 		location	= $targetLocation
 		properties	= $properties
+		dependsOn	= @()
 	}
 
 	# BICEP
 	if ($useBicep) {
+		# add parent
 		$res.parent = "<$(get-bicepNameByType 'Microsoft.Compute/virtualMachines' $vmName)>"
+
+		# add dependency on other extensions 
+		# This makes sure that only one extension is installed at the same time
+		if ($null -ne $provisionAfter) {
+			# get dependent BICEP name
+			$script:bicepNamesAll.Values
+			| Where-Object type -eq 'Microsoft.Compute/virtualMachines/extensions'
+			| Where-Object name -eq "$vmName/$provisionAfter"
+			| ForEach-Object {
+
+				$res.dependsOn += "<$($_.bicepName)>"
+			}
+		}
 	}
 
 	# ARM
@@ -21876,27 +23219,27 @@ function update-vmExtensionsPublic {
 		# LINUX
 		if ($_.OsDisk.OsType -eq 'linux') {
 
-			new-vmExtension $vmName `
-				'AzureMonitorLinuxAgent' `
-				'AzureMonitorLinuxAgent' `
-				'Microsoft.Azure.Monitor' `
-				'1.30' `
-				@{
-					GCS_AUTO_CONFIG = $True
-				} -autoUpgradePossible
+			new-vmExtension `
+				-vmName	$vmName `
+				-extensionType 'AzureMonitorLinuxAgent' `
+				-extensionName 'AzureMonitorLinuxAgent' `
+				-publisher 'Microsoft.Azure.Monitor' `
+				-handlerVersion '1.41' `
+				-settings @{ GCS_AUTO_CONFIG = $True } `
+				-autoUpgradePossible
 		}
 
 		# WINDOWS
 		else {
 
-			new-vmExtension $vmName `
-				'AzureMonitorWindowsAgent' `
-				'AzureMonitorWindowsAgent' `
-				'Microsoft.Azure.Monitor' `
-				'1.24' `
-				@{
-					GCS_AUTO_CONFIG = $True
-				} -autoUpgradePossible
+			new-vmExtension `
+				-vmName	$vmName `
+				-extensionType 'AzureMonitorWindowsAgent' `
+				-extensionName 'AzureMonitorWindowsAgent' `
+				-publisher 'Microsoft.Azure.Monitor' `
+				-handlerVersion '1.42' `
+				-settings @{ GCS_AUTO_CONFIG = $True } `
+				-autoUpgradePossible
 		}
 	}
 }
@@ -23281,6 +24624,435 @@ function test-VPN {
 	}
 }
 
+#--------------------------------------------------------------
+function get-shellScripts {
+#--------------------------------------------------------------
+	if ($prePatchCommand -like '*"*') {
+		write-logFileError "Parameter 'prePatchCommand' must not contain double quotes"
+	}
+
+	if ($postPatchCommand -like '*"*') {
+		write-logFileError "Parameter 'postPatchCommand' must not contain double quotes"
+	}
+
+	#--------------------------------------------------------------
+	# Windows patches
+	$file = 'powershell\windowsPatches.psm1'
+	$script:WindowsPatchScript = Get-Content `
+					-Path (Join-Path -Path $pwshPath -ChildPath $file) `
+					-Raw `
+					-ErrorAction 'SilentlyContinue'
+	test-cmdlet 'Get-Content'  "Reading file '$file' failed"
+
+
+	#--------------------------------------------------------------
+	# Linux patches
+	$script:LinuxPatchScript = @"
+#!/bin/bash
+patchAll='$("$patchAll".toLower())'
+prePatchCommand="$prePatchCommand"
+postPatchCommand="$postPatchCommand"
+`n
+"@
+	# get file
+	$file = 'bash\linuxPatches.sh'
+	$script:LinuxPatchScript += Get-Content `
+					-Path (Join-Path -Path $pwshPath -ChildPath $file) `
+					-Raw `
+					-ErrorAction 'SilentlyContinue'
+	test-cmdlet 'Get-Content'  "Reading file '$file' failed"
+}
+
+#-------------------------------------------------------------
+function step-patchOS {
+#-------------------------------------------------------------
+	write-stepStart "Patching VMs"
+	if ($ignorePatchErrors) {
+		write-logFileWarning "Errors during VM patching will be ignored" `
+							"(can be changed by setting parameter ignorePatchErrors=`$false)"
+	}
+	
+	get-shellScripts
+
+	# copyMode: set $script:patchVMs
+	if (!$patchMode) {
+		if ('patchVMs' -notin $boundParameterNames) {
+			$script:patchVMs = convertTo-array ($script:copyVMs.Values | Where-Object Skip -eq $false).Name
+		}
+	}
+
+	# nothing to do
+	if ($patchVMs.count -eq 0) {
+		write-logFileWarning "No VMs to patch"
+		write-stepEnd
+		return
+	}
+
+	# process $all VMs
+	$script:shellJobs = @{}
+	foreach ($vm in $patchVMs) {
+		$vmName = $vm
+		# get name of renamed VM
+		if (!$SourceOnlyMode) {
+			if ($script:copyVMs[$vm].Rename.length -ne 0) {
+				$vmName = $script:copyVMs[$vm].Rename
+			}
+		}
+
+		# choose script
+		$osType = $script:copyVMs[$vm].OsDisk.OsType 
+		if ($osType -eq 'Linux') {
+			$scriptText = $script:LinuxPatchScript
+			$scriptPath = Join-Path $pathExportFolder -ChildPath "$logPrefixTarget.patchLinux.$vmName.txt"
+		}
+		else {
+			$scriptText = $script:WindowsPatchScript
+			$scriptPath = Join-Path $pathExportFolder -ChildPath "$logPrefixTarget.patchWindows.$vmName.txt"
+		}
+		$script:logFiles += $scriptPath
+
+		# start PS job that starts shell script in VM
+		invoke-shellScriptAsJob `
+			-scriptVm $vmName `
+			-description "VM $vmName $osType Update" `
+			-scriptText $scriptText `
+			-scriptPath $scriptPath `
+			-scriptType 'OsPatch' `
+			-osType $osType `
+			-jobIdOrigin $null `
+			-ignoreErrors $ignorePatchErrors
+	}
+
+	# collect results from PS job
+	# reboot VMs if needed
+	# repeat OS update if needed (and reboot again)
+	receive-jobs4shellScript
+
+	write-stepEnd
+}
+
+#--------------------------------------------------------------
+function invoke-shellScriptAsJob {
+#--------------------------------------------------------------
+	# start local PS job that starts shell script in VM
+	param (
+		 $scriptVm			# VM name where the script is being executed
+		,$description		# description of job
+		,$scriptText		# code of running script
+		,$scriptPath		# temporary file that contains scriptText
+		,$scriptType		# 'OsPatch', 'Reboot', 'OsPatchRepeat'
+
+		,$osType			# 'Windows', 'Linux'
+		,$jobIdOrigin		# jobId of orign job (when repeating job)
+		,$ignoreErrors		= $false
+
+		,$subscriptionName	= $targetSub
+		,$userName			= $targetSubUser
+		,$userTenant		= $targetSubTenant
+		,$rgName			= $targetRG
+	)
+
+	if ($scriptType -ne 'Reboot') {
+		write-taskStart $description
+	}
+
+	# save script as file
+	if ($null -ne $scriptText) {
+		Set-Content `
+			-Path $scriptPath `
+			-Value $scriptText `
+			-ErrorAction 'SilentlyContinue'
+		test-cmdlet 'Set-Content'  "Writing file '$scriptPath' failed"
+	}
+
+	# read invoke script only once
+	if ($null -eq $script:invokeScript) {
+		$file = 'powershell\invoke.psm1'
+		$script:invokeScript = Get-Content `
+			-Raw `
+			-Path (Join-Path -Path $pwshPath -ChildPath $file) `
+			-ErrorAction 'SilentlyContinue'
+		test-cmdlet 'Get-Content'  "Reading file '$file' failed"
+	}
+
+	switch ($scriptType) {
+		#--------------------------------------------------------------
+		'OsPatch' {
+			wait-vmAgent $rgName $scriptVm
+
+			if ($osType -ne 'Linux') {
+				$commandId = 'RunPowerShellScript'
+			}
+			else {
+				$commandId = 'RunShellScript'
+			}
+
+			# replace parameters in script
+			$jobText = $script:invokeScript `
+						-creplace '\$TEXT_INVOKE_SUB_NAME',		$subscriptionName `
+						-creplace '\$TEXT_INVOKE_USER_NAME',	$userName `
+						-creplace '\$TEXT_INVOKE_TENANT',		$userTenant `
+						-creplace '\$TEXT_INVOKE_RG_NAME',		$rgName `
+						-creplace '\$TEXT_INVOKE_VM_NAME', 		$scriptVM `
+						-creplace '\$TEXT_INVOKE_COMMAND_ID', 	$commandId `
+						-creplace '\$TEXT_INVOKE_SCRIPT_PATH', 	$scriptPath
+
+			# convert string to script
+			$jobBlock = [scriptblock]::create($jobText)
+
+			$jobObject = Start-Job `
+				-ScriptBlock $jobBlock `
+				-ErrorAction 'SilentlyContinue'
+			test-cmdlet 'Start-Job'  "Starting job failed"
+
+			$jobIdOrigin = $jobObject.Id
+		}
+
+		#--------------------------------------------------------------
+		'Reboot' {
+			$jobText = $null
+
+			$jobObject = Restart-AzVM `
+				-ResourceGroupName $rgName `
+				-Name $scriptVm `
+				-AsJob `
+				-ErrorAction 'SilentlyContinue'
+			test-cmdlet 'Restart-AzVM'  "Restarting VM as job failed"
+		}
+
+		#--------------------------------------------------------------
+		'OsPatchRepeat' {
+			wait-vmAgent $rgName $scriptVm
+
+			$jobText = $script:shellJobs[$jobIdOrigin].jobText
+			$jobBlock = [scriptblock]::create($jobText)
+
+			$jobObject = Start-Job `
+				-ScriptBlock $jobBlock `
+				-ErrorAction 'SilentlyContinue'
+			test-cmdlet 'Start-Job'  "Starting job failed"
+		}
+	}
+
+	# save status of running jobs
+	$script:shellJobs[$jobObject.Id] = @{
+		scriptVm		= $scriptVm
+		description		= $description
+		# scriptText		= $scriptText
+		# scriptPath		= $scriptPath
+		scriptType		= $scriptType	# 'OsPatch', 'Reboot', 'OsPatchRepeat'
+		
+		osType			= $osType
+		jobIdOrigin		= $jobIdOrigin
+		ignoreErrors	= $ignoreErrors
+
+		jobText			= $jobText	# contains $scriptPath, which contains $scriptText
+		job				= $jobObject
+		jobId			= $jobObject.Id
+		jobRepeatCount	= 0
+
+		startTime			= get-date
+		endTime				= $null
+		duration			= $null
+		durationInMinutes	= $null
+		state				= $null
+	}
+	write-logFile
+}
+
+#--------------------------------------------------------------
+function receive-jobs4shellScript {
+#--------------------------------------------------------------
+	# collect results from local PS job
+	write-logFile
+
+	$runningJobs = $script:shellJobs.Values | Where-Object {$null -eq $_.endTime} | Sort-Object jobId
+	while ($runningJobs.count -gt 0) {
+
+		foreach ($running in $runningJobs) {
+			
+			$vmName			= $running.scriptVm
+			$description	= $running.description
+			$scriptType		= $running.scriptType
+			$osType 		= $running.osType
+			$jobIdOrigin	= $running.jobIdOrigin
+			$ignoreErrors	= $running.ignoreErrors	
+			$state			= $running.job.State
+
+			# save runtime
+			if ($state -in @('Failed', 'Stopped', 'Completed')) {
+				$running.endTime = Get-Date
+				$running.duration = $running.endTime - $running.startTime
+				$running.durationInMinutes = "{0:N2}" -f $running.duration.TotalMinutes
+				$running.state = $state
+			}
+
+			#--------------------------------------------------------------
+			# Powershell job states: Failed/Stopped
+			if ($state -in @('Failed', 'Stopped')) {
+				# 1st possible error: job failed
+				write-logFileWarning "PowerShell job '$description' failed with state = $state" `
+									-stopCondition !$ignoreErrors
+
+				# reboot and retry
+				$rebootRequired = 'true'
+			}
+
+			#--------------------------------------------------------------
+			# Powershell job state: Completed
+			elseif ($state -eq 'Completed') {		
+				# run or repeat job finished
+				if ($scriptType -in @('OsPatch', 'OsPatchRepeat')) {
+
+					write-taskStart "RESULTS: $($running.description)"
+					$messages = $running.job.ChildJobs.Information -join "`n"
+
+					write-logFile $messages -ForegroundColor 'Cyan'
+					$invokeStatus 		= get-variableFromText $messages 'INVOKE_STATUS'
+					$rebootRequired 	= get-variableFromText $messages 'REBOOT_REQUIRED'
+
+					# 2nd possible error: Invoke-AzVMRunCommand failed in job
+					if ($invokeStatus -ne 'Succeeded') {
+						write-logFileWarning "Invoking script for VM $vmName failed" `
+											"INVOKE_STATUS='$invokeStatus'" `
+											-stopCondition !$ignoreErrors
+						# reboot and retry
+						$rebootRequired = 'true'
+						$running.state = 'InvokeFailed'
+					}				
+	
+					# 3rd possible error: exception in script
+					if ((($osType -eq 'Linux') -and ($messages -like '*++ exit 1*'))) {
+						write-logFileWarning "Script in VM $vmName returned exit code 1" `
+												-stopCondition !$ignoreErrors
+						# reboot and retry
+						$rebootRequired = 'true'
+						$running.state = 'ExitCode1'
+					}	
+				}
+
+				# reboot job finished
+				else {
+					$rebootRequired = 'false'
+				}
+
+				#--------------------------------------------------------------
+				# Reboot if needed
+				if ($rebootRequired -ne 'false') {
+
+					invoke-shellScriptAsJob `
+						-scriptVm $vmName `
+						-description "VM $vmName Reboot" `
+						-scriptType 'Reboot' `
+						-osType $osType `
+						-jobIdOrigin $jobIdOrigin `
+						-ignoreErrors $ignoreErrors
+				}
+
+				#--------------------------------------------------------------
+				# repeating job after Reboot or failure
+				elseif ($scriptType	-eq 'Reboot') {
+
+					# execute script not more than 3 times
+					if ($script:shellJobs[$running.jobIdOrigin].jobRepeatCount -lt 3) {
+						$script:shellJobs[$running.jobIdOrigin].jobRepeatCount += 1
+
+						$jobRepeatCount = $script:shellJobs[$running.jobIdOrigin].jobRepeatCount
+						switch ($jobRepeatCount) {
+							1 {  
+								$num = '1st'
+							}
+
+							2 {
+								$num = '2nd'
+							}
+
+							3 {
+								$num = '3rd'
+							}
+
+							Default {
+								$num = "$jobRepeatCount" + "th"
+							}
+						}
+
+						invoke-shellScriptAsJob `
+							-scriptVm $vmName `
+							-description "VM $vmName $osType Update ($num repeat)" `
+							-scriptType 'OsPatchRepeat' `
+							-osType $osType `
+							-jobIdOrigin $jobIdOrigin `
+							-ignoreErrors $ignorePatchErrors
+					}
+				}
+				write-logFile
+			}
+		}
+
+		# update runningJobs: job might have finished, new job might have been created
+		$runningJobs = $script:shellJobs.Values | Where-Object {$null -eq $_.endTime} | Sort-Object jobId
+
+		# wait for running jobs
+		if ($runningJobs.count -gt 0) {
+			# display running jobs
+			write-logFile "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss \U\T\Cz') Running jobs:" -ForegroundColor 'DarkGray'
+			foreach ($running in $runningJobs) {
+				write-logFile "Job ID $($running.jobId): $($running.description)"
+			}
+			write-logFile
+
+			# wait up to 5 minutes
+			Wait-Job -Id $runningJobs.jobId -Any -TimeOut 300 | Out-Null
+		}
+	}
+
+	$startTime	= ($script:shellJobs.Values.startTime | Measure-Object -Minimum).Minimum
+	$endTime	= ($script:shellJobs.Values.startTime | Measure-Object -Maximum).Maximum
+	$duration	= $endTime -$startTime
+	$durationInMinutes = "{0:N2}" -f $duration.TotalMinutes
+
+	write-logFile
+	write-logFile "All jobs finished in $durationInMinutes minutes"
+	$script:shellJobs.Values 
+	| Select-Object jobId, description, durationInMinutes, state
+	| Sort-Object jobId
+	| Format-Table
+	| write-LogFilePipe
+}
+
+#--------------------------------------------------------------
+function get-variableFromText {
+#--------------------------------------------------------------
+	param (
+		$text,
+		$variable,
+		[switch] $decimal
+	)
+
+	# get first match with value in quotes
+	if ($text -match "$variable='[^']*'") { 
+		$result = ($matches.0 -split "'")[1]
+	}
+	# get first match with value in double quotes
+	elseif ($text -match "$variable=`"[^`"]*`"") {
+		$result = ($matches.0 -split '"')[1]
+	}
+	# no match
+	else {
+		$result =  $Null
+	}
+
+	if ($decimal) {
+		$result = $result -as [decimal]
+		if (!($result -gt 0)) {
+			write-logFileError "Invalid measurement: $variable"
+		}
+	}
+
+	return $result
+}
+
+
 #**************************************************************
 # Main program
 #**************************************************************
@@ -23839,9 +25611,22 @@ try {
 
 		$targetSubID = $targetSubProperies.Id
 		$targetSubInternal = ($targetSubProperies.SubscriptionPolicies.LocationPlacementId -like 'Internal*')
+
+		#--------------------------------------------------------------
+		# defaults for MS-internal subscriptions
 		if ($targetSubInternal) {
 			$script:targetNoSaKeys = $true
 		}
+
+		#--------------------------------------------------------------
+		# other defaults in copy mode
+		if ('ignoreExtensionErrors' -notin $boundParameterNames) {
+			$script:ignoreExtensionErrors = $true
+		}
+		if ('ignorePatchErrors' -notin $boundParameterNames) {
+			$script:ignorePatchErrors = $true
+		}
+
 		$targetSubAllowNSP = ((Get-AzProviderFeature `
 										-FeatureName 'AllowNetworkSecurityPerimeter' `
 										-ProviderNamespace 'Microsoft.Network' `
@@ -23958,30 +25743,31 @@ try {
 		
 		write-logFile
 		set-context $sourceSub # *** CHANGE SUBSCRIPTION **************
+
+		# check if source and target are identical
+		if ( ($sourceSub -eq $targetSub) `
+		-and ($sourceRG -eq $targetRG) ) {
+	
+			if (!$justCreateSnapshots -and !$justDeleteSnapshots) {
+				write-logFileError "Source and Target Resource Group are identical"
+			}
+		}
+	
+		# target location not found
+		if ($null -eq $targetLocationDisplayName) {
+			if (!$justCreateSnapshots -and !$justDeleteSnapshots) {
+				write-logFileError "Target Region '$targetLocation' not found"
+			}
+		}
 	}
 	write-logFile
 
-	# check if source and target are identical
-	if ( ($sourceSub -eq $targetSub) `
-	-and ($sourceRG -eq $targetRG) `
-	-and (!$mergeMode) ) {
-
-		if (!$justCreateSnapshots -and !$justDeleteSnapshots) {
-			write-logFileError "Source and Target Resource Group are identical"
-		}
-	}
-
-	# target location not found
-	if ($null -eq $targetLocationDisplayName) {
-		if (!$justCreateSnapshots -and !$justDeleteSnapshots) {
-			write-logFileError "Target Region '$targetLocation' not found"
-		}
-	}
-
-	
 	#--------------------------------------------------------------
 	# debug actions
 	#--------------------------------------------------------------
+	if ($patchMode -or $patchVMsTargetRG) {
+		assert-hashes "For patching VMs, additional RGCOPY files are needed"
+	}
 
 	#--------------------------------------------------------------
 	# parameter justDeleteSnapshots
@@ -24056,7 +25842,8 @@ try {
 		# install OS patches
 		$script:patchesFailed = 0
 		if (!$skipPatch) {
-			step-patchMode
+			start-VMsParallel $targetRG $patchVMs
+			step-patchOS
 		}
 
 		# install VM extensions
@@ -24175,17 +25962,9 @@ try {
 	}
 
 	# extensions
-	if ($skipDeployment) {
+	if ($skipDeployment -and !$simulate) {
 		$skipExtensions = $true
 	}
-
-	# if (!$skipExtensions) {
-	# 	if (!$targetSubInternal) {
-	# 		if (!$forceExtensions) {
-	# 			$skipExtensions = $true
-	# 		}
-	# 	}
-	# }
 	
 	#--------------------------------------------------------------
 	# output of steps

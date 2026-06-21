@@ -52,11 +52,33 @@ for ((n=0; n<len; n++)); do
 
     echo "using mount point:          $(pwd)"
 
-    # check if nofail is set when mountPoint is in fstab
-    if (cat /etc/fstab | grep $mountPoint | grep -q -v nofail); then 
-        echo "/etc/fstab contains entry for mount point $mountPoint but option 'nofail' is missing"
+    # check if nofail is set for all mount points 
+    # except / and /boot*
+    # except comment lines ^\s*#
+    mp=$(cat /etc/fstab \
+        | sed 's/[ \t]\+/ /g' \
+        | grep -Fv -e ' / ' -e ' /boot' -e 'nofail' \
+        | grep -v '^\s*#' \
+        | head -n 1 \
+        | cut -d' ' -f2)
+    if [[ -n "$mp" ]]; then
+        echo "/etc/fstab contains entry for mount point $mp but option 'nofail' is missing"
         echo '++ exit 1'
-        exit 1
+        # exit 1
+    fi
+
+    # not allowed: /dev/sd* /dev/nvme*
+    # allowed: /dev/disk/* /dev/mapper/*
+    dev=$(cat /etc/fstab \
+        | sed 's/[ \t]\+/ /g' \
+        | grep -v '^\s*#' \
+        | cut -d' ' -f1 \
+        | grep -E '^/dev/sd|^/dev/nvme' \
+        | head -n 1)
+    if [[ -n "$dev" ]]; then
+        echo "/etc/fstab contains entry for device $dev. Use instead: /dev/disk/*"
+        echo '++ exit 1'
+        # exit 1
     fi
 
     # remove old log file + backup file

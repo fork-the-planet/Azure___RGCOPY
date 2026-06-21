@@ -1,4 +1,20 @@
 ## Version history
+#### RGCOPY 0.9.71 June 2026
+type|change
+:---|:---
+feature|check `/etc/fstab` during file backup
+feature|Support of resource type `Microsoft.Network/applicationSecurityGroups`
+feature|Support of resource type `Microsoft.Network/privateEndpoints`
+feature|Support of resource type `Microsoft.Network/privateDnsZones`
+feature|Support of resource type `Microsoft.Network/routeTables`
+feature|Support additional properties of resource types. Display a warning when a property is not copied by RGCOPY.
+feature|New parameter `keepUnusedResources`
+feature|Remove parameter `skipNatGateway`
+feature|Make sure that VM extensions are not installed in parallel.<BR>Update handler version of VM extensions.<BR>New parameter switch `ignoreExtensionErrors` (set by default).
+feature|Support for Confidential VMs
+feature|New parameter `setVMEncryptionAtHost`
+feature|Parallel running OS updates.<BR>Remove parameter `patchKernel`.<BR>New parameters `patchVMsTargetRG`, `ignorePatchErrors`, `postPatchCommand`
+
 #### RGCOPY 0.9.70 April 2026
 type|change
 :---|:---
