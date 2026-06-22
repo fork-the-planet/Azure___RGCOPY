@@ -1,6 +1,6 @@
 <#
 rgcopy.ps1:       Copy Azure Resource Group
-version:          0.9.71
+version:          0.9.72
 version date:     June 2026
 Author:           Martin Merdes
 Public Github:    https://github.com/Azure/RGCOPY
@@ -4149,11 +4149,7 @@ function save-copyDisks {
 		}
 
 		# different user or tenant
-		$differentTenantOrUser = $false
-		if (($sourceSubUser   -ne $targetSubUser) `
-		-or ($sourceSubTenant -ne $targetSubTenant)) {
-
-			$differentTenantOrUser	= $true
+		if ($differentTenantOrUser) {
 			$blobCopy 				= $True
 			$snapshotCopy 			= $False
 		}
@@ -10400,7 +10396,12 @@ function update-vmSize {
 		$script:templateVariables."vmMemGb$name" = $MemoryGB
 
 		$_.properties.hardwareProfile.vmSize = $vmSize
-		$_.properties.securityProfile.encryptionAtHost = $script:copyVMs[$vmName].EncryptionAtHost
+		if ($script:copyVMs[$vmName].EncryptionAtHost) {
+			$_.properties.securityProfile.encryptionAtHost = $true
+		}
+		else {
+			$_.properties.securityProfile.encryptionAtHost = $null
+		}
 	}
 }
 
@@ -19760,10 +19761,15 @@ function test-property {
 	param (
 		$property,
 		$value,
+		$text,
 		[switch] $unknownProperty,	# property not found in Get-AzXXX
 		[switch] $displayProperty,	# property is not needed for deployment (e.g. current state)
 		[switch] $uselessProperty	# property does not fit for RGCOPY (e.g. VM image)
 	)
+
+	if ($null -eq $text) {
+		$text = 'skipped by RGCOPY'
+	}
 
 	# property not found in az-cmdlet: value is unknown
 	# Therefore, it cannot be set by RGCOPY
@@ -19784,7 +19790,7 @@ function test-property {
 	}
 
 	# value set, but ignored by RGCOPY
-	write-logFileUpdates $script:testResourceType $script:testResourceName -warning "property '$property' skipped by RGCOPY"
+	write-logFileUpdates $script:testResourceType $script:testResourceName -warning "property '$property' $text"
 }
 
 #--------------------------------------------------------------
@@ -20135,9 +20141,16 @@ function add-az_virtualNetworks {
 
 		# ddosProtectionPlan
 		$ddosProtectionPlan = $null
+		$enableDdosProtection = $null
 		if ($null -ne $az_res.DdosProtectionPlan.Id) {
-			$ddosProtectionPlan = @{
-				id = $az_res.DdosProtectionPlan.Id	# use existing DDOS protection plan. Do not copy the plan
+			if ($differentTenantOrUser) {
+				test-property 'DdosProtectionPlan' $true 'ignored when copying with different tenant/user'
+			}
+			else {
+				$enableDdosProtection = convertTo-Boolean $az_res.EnableDdosProtection
+				$ddosProtectionPlan = @{
+					id = $az_res.DdosProtectionPlan.Id	# use existing DDOS protection plan. Do not copy the plan
+				}
 			}
 		}
 
@@ -20156,7 +20169,7 @@ function add-az_virtualNetworks {
 				# bgpCommunities
 				DdosProtectionPlan			= $ddosProtectionPlan
 				dhcpOptions					= $dhcpOptions			
-				enableDdosProtection 		= convertTo-Boolean $az_res.EnableDdosProtection
+				enableDdosProtection 		= $enableDdosProtection
 				# enableVmProtection
 				encryption = @{
 					enabled					= convertTo-Boolean $az_res.Encryption.Enabled
@@ -20299,7 +20312,7 @@ function add-az_publicIPAddresses {
 
 		# ddosProtectionPlan
 		$ddosSettings = $null
-		if ($null -ne $az_res.DdosSettings) {
+		if (($null -ne $az_res.DdosSettings) -and !$differentTenantOrUser) {
 			# DOS Settings
 			$ddosSettings = @{
 				ddosProtectionPlan  	= $null
@@ -21373,24 +21386,26 @@ function add-az_privateEndpoints {
 
 		#--------------------------------------------------------------
 		$privateLinkServiceConnections = @()
+		$testTenant = $false
 		foreach ($item in $az_res.PrivateLinkServiceConnections) {
 
 			# get service ID, e.g. /subscriptions/../storageAccounts/saNameOld
 			$privateLinkServiceId = $item.PrivateLinkServiceId
 
-			# replace service ID if it is a copied storage account
 			$r = get-resourceComponents $privateLinkServiceId
-			if ($r.subscriptionID -eq $sourceSubID) {
-				if ($r.resourceGroup -eq $sourceRG) {
-					if ($r.mainResourceType -eq 'storageAccounts') {
-	
-						$oldName = $script:copySA[$r.mainResourceName].oldName
-						if ($null -ne $oldName) {
-							# old bicep name for saNameNew
-							$privateLinkServiceId = "<$(get-bicepNameByType 'Microsoft.Storage/storageAccounts' $oldName).id>"
-						}
-					}
-				}
+			# old bicep name for saNameNew
+			$oldName = $script:copySA[$r.mainResourceName].oldName
+			
+			# replace service ID if it is a copied storage account
+			if (($r.subscriptionID -eq $sourceSubID) `
+			-and ($r.resourceGroup -eq $sourceRG) `
+			-and ($r.mainResourceType -eq 'storageAccounts') `
+			-and ($null -ne $oldName)) {
+				$privateLinkServiceId = "<$(get-bicepNameByType 'Microsoft.Storage/storageAccounts' $oldName).id>"
+			}
+			# keep service ID
+			else {
+				$testTenant = $true
 			}
 
 			# get groupIds
@@ -21487,30 +21502,37 @@ function add-az_privateEndpoints {
 				subnet = $subnet
 			}
 		}
-		test-property 'manualPrivateLinkServiceConnections' $az_res.ManualPrivateLinkServiceConnections
 
-		add-resourcesALL $resource $az_res
+		# do not copy private endpoint to different tenant
+		if ($testTenant -and $differentTenantOrUser) {
+			write-logFileWarning "Cannot copy Private Endpoint '$($az_res.Name)' with different tenant/user"
+		}
 
-		#--------------------------------------------------------------
-		# sub-resource privateDnsZoneGroups
-		$endpointId 		= $az_res.Id
-		$endPointName		= $az_res.Name
-		$privateDnsZones	= @( $script:az_privateDnsZones | Where-Object Id -like "$endpointId/*" )
-
-		foreach ($az_resDns in $privateDnsZones) {
-			# create resource
-			$resource = @{
-				type 		= 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups'
-				apiVersion	= '2025-05-01'
-				dependsOn	= @( "<$(get-bicepNameByType 'Microsoft.Network/privateEndpoints' $endPointName)>" )
-				# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
-
-				properties	= @{
-					privateDnsZoneId = get-bicepReference $az_resDns.PrivateDnsZoneId
-				}
-			}
+		else {
+			test-property 'manualPrivateLinkServiceConnections' $az_res.ManualPrivateLinkServiceConnections
+			add-resourcesALL $resource $az_res
 	
-			add-resourcesALL $resource $az_resDns -resName "$endPointName/$($az_resDns.Name)"
+			#--------------------------------------------------------------
+			# sub-resource privateDnsZoneGroups
+			$endpointId 		= $az_res.Id
+			$endPointName		= $az_res.Name
+			$privateDnsZones	= @( $script:az_privateDnsZones | Where-Object Id -like "$endpointId/*" )
+	
+			foreach ($az_resDns in $privateDnsZones) {
+				# create resource
+				$resource = @{
+					type 		= 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups'
+					apiVersion	= '2025-05-01'
+					dependsOn	= @( "<$(get-bicepNameByType 'Microsoft.Network/privateEndpoints' $endPointName)>" )
+					# name, location, extendedLocation, placement, tags, zones:		set in add-resourcesALL
+	
+					properties	= @{
+						privateDnsZoneId = get-bicepReference $az_resDns.PrivateDnsZoneId
+					}
+				}
+		
+				add-resourcesALL $resource $az_resDns -resName "$endPointName/$($az_resDns.Name)"
+			}
 		}
 	}
 }
@@ -24105,9 +24127,7 @@ function start-azcopy {
 
 	# never create user delegation token, if same user for source and target
 	# In this case, use oAuth with a single user
-	# if ( ($sourceSubUser   -eq $targetSubUser) `
-	# -and ($sourceSubTenant -eq $targetSubTenant)) {
-
+	# if (!$differentTenantOrUser) {
 	# 	if ('ignoreDelKeySource' -notin $boundParameterNames) {
 	# 		$script:ignoreDelKeySource = $true
 	# 	}
@@ -24234,9 +24254,7 @@ $azcopyPath copy ``
 	-and ($null -eq $kindTokenTarget)) {
 
 		# source and target user are NOT the same
-		if (($sourceSubUser   -ne $targetSubUser) `
-		-or ($sourceSubTenant -ne $targetSubTenant)) {
-
+		if ($differentTenantOrUser) {
 			write-logFileError "OAuth authentication only possible for source AND target when using same user"
 			# do not use parameters source-oauth-token or destination-oauth-token
 			# Thes parameters are not documented. Furthermore, an oAuth token is only guarantied for 5 minutes
@@ -25760,6 +25778,16 @@ try {
 			}
 		}
 	}
+
+	# check if same user given
+	if (($sourceSubUser   -ne $targetSubUser) `
+	-or ($sourceSubTenant -ne $targetSubTenant)) {
+		
+		$script:differentTenantOrUser = $true
+	}
+	else {
+		$script:differentTenantOrUser = $false
+	}
 	write-logFile
 
 	#--------------------------------------------------------------
@@ -25942,9 +25970,7 @@ try {
 	}
 
 	# remote copy needed?
-	if (($sourceSubUser   -ne $targetSubUser) `
-	-or ($sourceSubTenant -ne $targetSubTenant)) {
-
+	if ($differentTenantOrUser) {
 		$RemoteCopyNeeded = $True
 	}
 

@@ -1,4 +1,10 @@
 ## Version history
+#### RGCOPY 0.9.72 June 2026
+type|change
+:---|:---
+bug fix|When copying to a different tenant: Do not apply existing DdosProtectionPlan, do not copy private Endpoints referring to different tenant
+bug fix|Set `securityProfile.encryptionAtHost` to `$null` rather than to `$false` if not set.  
+
 #### RGCOPY 0.9.71 June 2026
 type|change
 :---|:---
