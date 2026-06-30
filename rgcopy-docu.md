@@ -148,7 +148,7 @@ Step|parameter<BR>skip switch|usage
 :clock5: *start workload*| *optional step* | This step is used for testing SAP Workload. It has to be explicitly activated using switch **`startWorkload`**.
 :clock6: *cleanup*| *optional step* | By default, created snapshots in the source RG are not deleted by RGCOPY. <BR>:bulb: **Tip:** you can activate a cleanup using RGCOPY parameters. See section [Cost Efficiency](./rgcopy-docu.md#Cost-Efficiency) for details.
 
-> :bulb: **Tip:** When setting the parameter switch **`simulate`**, only an ARM template is created. All other steps are skipped. This is useful for checking whether configured resource changes are possible (VM size available in target region? Disk properties compatible with VM size? Subscription quota sufficient? ...)
+> :bulb: **Tip:** When setting the parameter switch **`simulate`**, only a BICEP template is created. All other steps are skipped. This is useful for checking whether configured resource changes are possible (VM size available in target region? Disk properties compatible with VM size? Subscription quota sufficient? ...)
 
 
 ### Disk Creation
@@ -203,14 +203,7 @@ By setting parameter `skipDiskCreation`, RGCOPY expects that all needed disks al
 !["skip disk creation"](/images/disks_skip_creation.png)
 
 
-### Using Bicep
-As of version 0.9.50, Rgcopy is creating a BICEP template rather than an ARM template. Using BICEP has several advantages:
-- You can copy a source RG with more than 200 resources. This is not possible when using ARM templates caused by a limitation of `Export-AzResourceGroup`
-- RGCOPY copies all supported resources from the source RG. In addition, it copies all supported resources that are directly or indirectly referenced by a virtual machine, even when these resources are located in a different resource group (This was not the case in RGCOPY versions that used ARM templates).However, all VMs and all disks must be located in the source RG.
-For example, a VM might be part of a Proximity Placement Group (PPG) that is stored in a different resource group. In this case, the VM and the PPG are both copied and will be stored in the target RG. However, it is not possible to copy 2 resources with the same type and same name (for example, a VM is using 2 network interface cards: a NIC with name NIC1 in resource group RG1 and a NIC with name NIC1 in resource group RG2).
-- The created BICEP template is better readable compared with the ARM template. The ARM template contains more dependencies which caused some unexpected trouble, which is not the case anymore with BICEP.
 
-RGCOPY automatically installs BICEP if it's not found.
 
 <div style="page-break-after: always"></div>
 
@@ -269,7 +262,7 @@ parameter|[DataType]: usage
 **`targetSub`**<BR>**`targetSubUser`**<BR>**`targetSubTenant`** | Same parameters as above but for the target subscription.<BR>Not needed if source and target subscription are identical
 
 ### Resource Configuration Parameters
-With resource configuration parameters you can change properties of various resources in the Target ARM template.
+With resource configuration parameters you can change properties of various resources in the BICEP template.
 
 Each of the configuration parameters has the following scheme:
 
@@ -312,7 +305,7 @@ parameter|usage (data type is always [string] or [array])
 **`setDiskBursting`** = `@("bool @ disk1,disk2,...", ...)`|Set Disk Bursting: <ul><li>**bool** in {True, False} </li><li>**disk**: disk name</li></ul> 
 **`setDiskMaxShares`** = <BR>`@("number @ disk1,disk2,...", ...)`|Set maximum number of shares for a Shared Disk: <ul><li>**number** in {1, 2, 3, ...}  </li><li>**disk**: disk name </li></ul> :memo: **Note:** For number = 1, it is not a Shared Disk anymore
 **`setDiskCaching`** = <BR>`@("caching/wa @ disk1,disk2...", ...)`	|Set Disk Caching: <ul><li>**caching** in {ReadOnly, ReadWrite, None} </li><li>**wa (writeAccelerator)** in {True, False} </li><li>**disk**: disk name</li></ul> :memo: **Examples:**<ul><li>`'ReadOnly'`: turns on ReadOnly cache for all disks</li><li>`'None/False'`: turns off caching and writeAccelerator for all disks</li><li>`'/False'`: turns off writeAccelerator for all disks (but keeps caching property)</li><li>`@('ReadOnly/True@disk1', '/False')`: turns on writeAccelerator (with ReadOnly cache) for disk1 and turns it off for all other disks in the resource group</li></ul>
-**`setVmDeploymentOrder`** = <BR>`@("prio @ vm1,vm2,...", ...)`				|Set VM deployment Order: <ul><li>**prio** in {1, 2, 3, ...}  </li><li>**vm**: VM name </li></ul>:memo: **Note:** This parameter is used during ARM template creation. You can define priories for deploying VMs. A VM with higher priority (lower number) will be deployed before VMs with lower priority. Hereby, you can ensure that an important VM (for example a domain controller) will be deployed before other VMs.
+**`setVmDeploymentOrder`** = <BR>`@("prio @ vm1,vm2,...", ...)`				|Set VM deployment Order: <ul><li>**prio** in {1, 2, 3, ...}  </li><li>**vm**: VM name </li></ul>:memo: **Note:** This parameter is used during BICEP template creation. You can define priories for deploying VMs. A VM with higher priority (lower number) will be deployed before VMs with lower priority. Hereby, you can ensure that an important VM (for example a domain controller) will be deployed before other VMs.
 **`setPrivateIpAlloc`** = <BR>`@("allocation @ ip1,ip2,...", ...)`		|Set Private IP Allocation Method: <ul><li>**allocation** in {Dynamic, Static}</li><li>**ip**: name of Private IP Address.</li></ul>
 **`removeFQDN`** = <BR>`@("bool @ ip1,ip2,...", ...)`		|Remove Fully Qualified Domain Names: <ul><li>**bool** in {True}</li><li>**ip**: name of Public IP Address.</li></ul>
 **`setAcceleratedNetworking`** = <BR>`@("bool @ nic1,nic2,...", ...)`		|Set Accelerated Networking: <ul><li>**bool** in {True, False} </li><li>**nic**: name of Virtual Network Interface.</li></ul>
@@ -483,7 +476,7 @@ parameter|[DataType]: usage
 parameter|[DataType]: usage
 :---|:---
 **`pathExportFolder`**<BR>|**[string]**: By default, RGCOPY creates all files in the user home directory. You can change the path for all RGCOPY files by setting parameter `pathExportFolder`.
-**`pathArmTemplate`**|**[string]**: You can deploy an existing (main) ARM template by setting this parameter. No snapshots are created, no ARM template is created and no resource configuration changes are possible.
+**`pathArmTemplate`**|**[string]**: You can deploy an existing BICEP template by setting this parameter. No snapshots are created, no BICEP template is created and no resource configuration changes are possible.
 
 <div style="page-break-after: always"></div>
 
@@ -493,8 +486,8 @@ parameter|[DataType]: usage
 **`copyDetachedDisks`** |**[switch]**: By default, only disks that are attached to a VM are copied to the target RG. By setting this switch, also detached disks are copied.
 **`maxDOP`**               |**[int]**: RGCOPY performs the following operations in parallel:<ul><li>snapshot creation</li><li>access token creation</li><li>access token deletion</li><li>snapshot deletion</li><li>VM start</li><li> VM stop</li></ul>By default, RGCOPY uses 16 parallel running threads for these tasks. You can change this using parameter `maxDOP`.
 **`jumpboxName`**          |**[string]**: When setting a jumpboxName, RGCOPY adds a Full Qualified Domain Name (FQDN) to the Public IP Address of the jumpbox. The FQDN is calculated from the name of the target RG. <BR>:memo: **Example:** `targetRG`=*test_resource_group* and `targetLocation`=*eastus*<BR>results in FQDN: *test-resource-group.eastus.cloudapp.azure.com*. <BR>RGCOPY uses the first Public IP Address of the first VM which fits the search for `*jumpboxName*`
-**`justCreateSnapshots`**  |**[switch]**: When setting this switch, RGCOPY only creates snapshots on the source RG (no ARM template creation, no deployment). This is useful for refreshing the snapshots for an existing ARM template.<BR>You can use parameter **`useIncSnapshots`** in addition for creating incremental snapshots rather than full snapshots.<BR>:warning: **Warning:** Setting this switch enables the **Update Mode**
-**`justDeleteSnapshots`**  |**[switch]**: When setting this switch, RGCOPY only deletes snapshots on the source RG (no ARM template creation, no deployment). <BR>Caution: you typically want to keep the existing snapshots since ARM templates within the same region refer to these snapshots.<BR>:warning: **Warning:** Setting this switch enables the **Update Mode**
+**`justCreateSnapshots`**  |**[switch]**: When setting this switch, RGCOPY only creates snapshots on the source RG (no BICEP template creation, no deployment). <BR>You can use parameter **`useIncSnapshots`** in addition for creating incremental snapshots rather than full snapshots.<BR>:warning: **Warning:** Setting this switch enables the **Update Mode**
+**`justDeleteSnapshots`**  |**[switch]**: When setting this switch, RGCOPY only deletes snapshots on the source RG (no BICEP template creation, no deployment). 
 
 <div style="page-break-after: always"></div>
 
@@ -813,7 +806,7 @@ You can use RGCOPY for creating the target RG in a different region. Therefore, 
 
 parameter|[DataType]: usage
 :---|:---
-**`netAppAccountName`** | **[string]**: Name of the created NetApp Account in the target RG.<BR>Default is `rgcopy-<targetRG>`<BR>:warning: **Warning:** NetApp Account names must be unique in Azure. This should be no issue when using the default name. Be aware that the NetApp Account name is stored as a constant in the ARM template created by RGCOPY. Therefore, it is not possible to re-use this ARM template for deploying another resource group.
+**`netAppAccountName`** | **[string]**: Name of the created NetApp Account in the target RG.<BR>Default is `rgcopy-<targetRG>`<BR>:warning: **Warning:** NetApp Account names must be unique in Azure. This should be no issue when using the default name. Be aware that the NetApp Account name is stored as a constant in the BICEP template created by RGCOPY. Therefore, it is not possible to re-use this BICEP template for deploying another resource group.
 **`netAppServiceLevel`** | **[string]**:Service Level of the created NetApp Pool.<BR>Allowed values: Standard, Premium, Ultra. Default is `Premium`
 **`netAppNetworkFeatures`** | **[string]**:Network Features for NetApp Volumes.<BR>Allowed values: Standard, Basic. Default is `Standard`
 **`netAppPoolName`** | **[string]**: Name of the created NetApp Pool.<BR>Default is `rgcopy-s-pool`, `rgcopy-p-pool`, `rgcopy-u-pool` (for Service Level **S**tandard, **P**remium, **U**ltra)
@@ -956,7 +949,7 @@ Disk SKU|set to **Premium_LRS** by default<BR>(can be changed using `setDiskSku`
 
 ***
 ## Update Mode
-You can activate RGCOPY Update Mode by setting parameter switch **`updateMode`**. In this mode, you can update resource properties in the source RG. No ARM template is created. No target RG is created or even used. Therefore, parameters `targetRG` and `targetLocation` are not allowed in this mode. Be aware that the RGCOPY log file name also changes in Update Mode, see section [Created Files](./rgcopy-docu.md#Created-Files).
+You can activate RGCOPY Update Mode by setting parameter switch **`updateMode`**. In this mode, you can update resource properties in the source RG. No BICEP template is created. No target RG is created or even used. Therefore, parameters `targetRG` and `targetLocation` are not allowed in this mode. Be aware that the RGCOPY log file name also changes in Update Mode, see section [Created Files](./rgcopy-docu.md#Created-Files).
 
 A simple example of this mode looks like this:
 
@@ -1127,7 +1120,7 @@ RGCOPY can start local PowerShell scripts in the following two scenarios. These 
 
 parameter|[DataType]: usage
 :---|:---
-**`pathPostDeploymentScript`**|**[string]**: path to local PowerShell script<BR>You can use this script for deploying additional ARM resources that cannot be exported from the source RG. <BR>When using this RGCOPY parameter, the following happens after deploying the ARM templates (in RGCOPY step *deployment*):<ol><li>SAP is started using parameter `scriptStartSapPath` (see below).</li><li>The PowerShell script located in `pathPostDeploymentScript` is started.</li></ol>
+**`pathPostDeploymentScript`**|**[string]**: path to local PowerShell script<BR>You can use this script for deploying additional resources.<BR>When using this RGCOPY parameter, the following happens after deploying the BICEP templates (in RGCOPY step *deployment*):<ol><li>SAP is started using parameter `scriptStartSapPath` (see below).</li><li>The PowerShell script located in `pathPostDeploymentScript` is started.</li></ol>
 **`pathPreSnapshotScript`**|**[string]**: path to local PowerShell script<BR>When using this RGCOPY parameter, the following happens:<ol><li>All VMs in the source RG  are started.</li><li>SAP is started using another script inside a VM. The script has to be specified using parameter`scriptStartSapPath` (see below).</li><li>The PowerShell script located in `pathPreSnapshotScript` is started.</li><li>RGCOPY waits by default for 5 minutes. This can be configured using parameter **`preSnapshotWaitSec`**</li><li>**All VMs in the source RG are stopped** (even when they where running before RGCOPY was started)</li><li>The disk snapshots are created.</li></ol>
 
 ### Remotely running scripts
@@ -1277,7 +1270,7 @@ Resources that are not mentioned above are **not copied**, even if they are loca
 
 Not all properties of the resources are copied, for example Network Peering is not copied. However, RGCOPY displays a warning for each property that is ignored by RGCOPY.
 
-In the **target RG**, the following ARM resources might be deployed in addition:
+In the **target RG**, the following resources might be deployed in addition:
 
 - Microsoft.Compute/virtualMachines/extensions
 - Microsoft.NetApp/netAppAccounts
@@ -1459,8 +1452,8 @@ tag-set.ps1 $resourceGroup vm2 'rgcopy.ScriptStartSap=/root/startSAP.sh@vm2'
 
 
 ### Analyzing Failed Deployments
-Azure is validating an ARM template as the first step of an deployment. This validation might fail for various reasons. In this case, you can see the errors **in the output of RGCOPY** (on the host and in the RGCOPY log file). RGCOPY performs several checks (including quota of VM families) before starting the deployment. The screenshot below is from a deployment that explicitly turned off RGCOPY quota checks (using RGCOPY switch `skipVmChecks`)
+Azure is validating a BICEP template as the first step of an deployment. This validation might fail for various reasons. In this case, you can see the errors **in the output of RGCOPY** (on the host and in the RGCOPY log file). RGCOPY performs several checks (including quota of VM families) before starting the deployment. The screenshot below is from a deployment that explicitly turned off RGCOPY quota checks (using RGCOPY switch `skipVmChecks`)
 
-If the ARM template validation succeeds but errors occur during deployment then you can check details of the deployment errors **in the Azure Portal**.
+If the BICEP template validation succeeds but errors occur during deployment then you can check details of the deployment errors **in the Azure Portal**.
 
 !["failedDeploymentRGCOPY"](/images/failedDeployment.png)

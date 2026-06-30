@@ -1,9 +1,17 @@
 ## Version history
+#### RGCOPY 0.9.73 July 2026
+type|change
+:---|:---
+feature|Allow copying confidential VMs to different regions.
+feature|Code cleanup: remove all references of parameter `useBicep`.<BR>Remove parameters `skipRemoteReferences`, `skipGreenlist`, `dualDeployment`, `pathArmTemplateDisks`, `skipWorkarounds`.
+feature|Check VM size capability `ConfidentialComputingType` before changing VM size of a confidential VM.
+feature|Automatically repeat REST API call (replacement for Grant-AzSnapshotAccess) if it does not return an SAS token for any reason (without any error!)
+
 #### RGCOPY 0.9.72 June 2026
 type|change
 :---|:---
-bug fix|When copying to a different tenant: Do not apply existing DdosProtectionPlan, do not copy private Endpoints referring to different tenant
-bug fix|Set `securityProfile.encryptionAtHost` to `$null` rather than to `$false` if not set.  
+feature|Enable RGCOPY for subscriptions that do *not* support the feature `encryptionAtHost`: Set `securityProfile.encryptionAtHost` to `$null` rather than to `$false` if not set. 
+bug fix|When copying to a different tenant: Do not apply existing DdosProtectionPlan, do not copy private Endpoints referring to a different tenant.
 
 #### RGCOPY 0.9.71 June 2026
 type|change
@@ -17,7 +25,7 @@ feature|Support additional properties of resource types. Display a warning when 
 feature|New parameter `keepUnusedResources`
 feature|Remove parameter `skipNatGateway`
 feature|Make sure that VM extensions are not installed in parallel.<BR>Update handler version of VM extensions.<BR>New parameter switch `ignoreExtensionErrors` (set by default).
-feature|Support for Confidential VMs
+feature|Support for Confidential VMs (within same region)
 feature|New parameter `setVMEncryptionAtHost`
 feature|Parallel running OS updates.<BR>Remove parameter `patchKernel`.<BR>New parameters `patchVMsTargetRG`, `ignorePatchErrors`, `postPatchCommand`
 
