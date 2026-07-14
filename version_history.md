@@ -1,11 +1,25 @@
 ## Version history
+#### RGCOPY 0.9.74 July 2026
+type|change
+:---|:---
+feature|Performance improvements when copying disks to different regions.<BR>RGCOPY is neither using BLOB copy nor snapshot copy when parameter `useAzCopy` is set. Instead, multiple instances of AzCopy are started in parallel (up-to `maxDOP`). This results in much higher CPU load and network traffic on the control plane, but is much faster.<BR>Therefore, you should start RGCOPY inside an Azure VM when using this feature.
+feature|Enable parallelism for copying storage account content (container, smb-shares, nfs-shares)
+feature|New parameter `azCopyRepeatCount`: repeats a failed AzCopy job several times. <BR>New parameters `showAzCopyLogs`, `azCopyLogLocation` and `skipLinuxCpuStats`.<BR>Rename parameter `copySaEnvironment` to `azCopyEnvironment`
+feature|Time measurement of RGCOPY and all its steps.
+feature|Declaring Update Mode as deprecated. Removing it from documentation.
+feature|Use as many threads as needed if parameter `maxDOP` is set to 0.
+feature|Delete parameter ~~`deleteTargetSA`~~. This has been done by default since years. If you want to keep the storage account, use parameter `keepRemoteSnapshotsBlobs` instead.
+bug fix|'Microsoft.Network/privateEndpoints/privateDnsZoneGroups' was not created correctly
+feature|Ignoring sporadic errors of Az-cmdlets during "Revoking access from snapshot".
+feature|New parameter `skipSaNwRules`
+
 #### RGCOPY 0.9.73 July 2026
 type|change
 :---|:---
 feature|Allow copying confidential VMs to different regions.
-feature|Code cleanup: remove all references of parameter `useBicep`.<BR>Remove parameters `skipRemoteReferences`, `skipGreenlist`, `dualDeployment`, `pathArmTemplateDisks`, `skipWorkarounds`.
+feature|Code cleanup: remove all references of former parameter `useBicep`.<BR>Remove parameters ~~`skipRemoteReferences`~~, ~~`skipGreenlist`~~, ~~`dualDeployment`~~, ~~`pathArmTemplateDisks`~~, ~~`skipWorkarounds`~~.
 feature|Check VM size capability `ConfidentialComputingType` before changing VM size of a confidential VM.
-feature|Automatically repeat REST API call (replacement for Grant-AzSnapshotAccess) if it does not return an SAS token for any reason (without any error!)
+feature|Automatically repeat REST API call (replacement for Grant-AzSnapshotAccess) if it does not return an SAS token for any reason (this might happen without any error!)
 
 #### RGCOPY 0.9.72 June 2026
 type|change
@@ -23,7 +37,7 @@ feature|Support of resource type `Microsoft.Network/privateDnsZones`
 feature|Support of resource type `Microsoft.Network/routeTables`
 feature|Support additional properties of resource types. Display a warning when a property is not copied by RGCOPY.
 feature|New parameter `keepUnusedResources`
-feature|Remove parameter `skipNatGateway`
+feature|Remove parameter ~~`skipNatGateway`~~
 feature|Make sure that VM extensions are not installed in parallel.<BR>Update handler version of VM extensions.<BR>New parameter switch `ignoreExtensionErrors` (set by default).
 feature|Support for Confidential VMs (within same region)
 feature|New parameter `setVMEncryptionAtHost`
@@ -33,7 +47,7 @@ feature|Parallel running OS updates.<BR>Remove parameter `patchKernel`.<BR>New p
 type|change
 :---|:---
 feature|Improve verify performance of file copy. New parameter `fileCopyVerify`.
-feature|Remove deprecated parameter `useBicep`.
+feature|Remove deprecated parameter ~~`useBicep`~~.
 
 #### RGCOPY 0.9.69 March 2026
 type|change

@@ -2,7 +2,7 @@
 
 RGCOPY (**R**esource **G**roup **COPY**) is a tool that copies the most important resources of an Azure resource group (**source RG**) to a new resource group (**target RG**). It can copy a whole landscape consisting of many servers within a single Azure resource group to a new resource group. The target RG might be in a different region or subscription. RGCOPY has been tested on **Windows**, **Linux** and in **Azure Cloud Shell**.
 
-The following example demonstrates the user interface of RGCOPY
+The first example demonstrates the user interface of RGCOPY
 
 ```powershell
 $rgcopyParameter = @{
@@ -17,11 +17,6 @@ $rgcopyParameter = @{
 
 !["RGCOPY"](/images/RGCOPY.png)
 
-RGCOPY has been developed for copying an SAP landscape and testing Azure with SAP workload. Therefore, it supports the most important Azure resources needed for SAP, for example **VMs**, **disks**, **load balancers**, storage accounts including content of **containers** and **shares**.
-
->:memo: **Note:** The list of supported Azure resources is maintained in the RGCOPY documentation: **[https://github.com/Azure/RGCOPY/blob/main/rgcopy-docu.md#Supported-Azure-Resources](./rgcopy-docu.md#Supported-Azure-Resources)**
-
-## Examples
 The following examples show the usage of RGCOPY. In all examples, a source RG with the name 'SAP_master' is copied to the target RG 'SAP_copy'. For better readability, the examples use parameter splatting, see <https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_splatting>. Before starting RGCOPY, you must run the PowerShell cmdlet `Connect-AzAccount`.
 
 ```powershell
@@ -102,35 +97,35 @@ $rgcopyParameter = @{
 .\rgcopy.ps1 @rgcopyParameter
 ```
 
-## Using RGCOPY for moving an SAP system to a different region
-We have seen a growing demand of moving complete SAP landscapes to a different region. Unfortunately, Azure Resource Mover does not support all required resource types. Therefore, RGCOPY has been improved to support this scenario in many cases. RGCOPY was originally a Microsoft internal test tool for coping Azure resources of a single resource group. It did not copy *all* properties of these resources. As of RGCOPY version June 2026:
-- The most important resource properties are copied. If a resource property is not copied then RGCOPY gives a **warning regarding the missing property**. Be aware that future resource properties (of future Azure features) can not be detected by the current RGCOPY version.
-- The number of supported resource types has grown. RGCOPY can now copy storage accounts including the content of BLOB containers and SMB/NFS shares. The full **list of supported resource types** is included in the **[documentation](./rgcopy-docu.md#Supported-Azure-Resources)**.
+## Using RGCOPY for moving an (SAP) system to a different region
+RGCOPY was originally a Microsoft internal test tool for coping an SAP system inside a single Azure resource group. RGCOPY did not copy *all* resource types in this resource group and did it not copy *all* properties of these resources.
+
+In the latest version, the scope of RGCOPY has changed from a specialized tool (that supports only features needed Microsoft internally) to a more universal tool. The following improvements have been implemented:
+- The number of supported resource types has grown. RGCOPY can even copy storage accounts including the content of BLOB containers and SMB/NFS shares. The full **list of supported resource types** is included in the **[documentation](./rgcopy-docu.md#Supported-Azure-Resources)**.
+- The most important resource properties are copied. If a resource property is not copied then RGCOPY gives a **warning regarding the missing property**. As a starting point, run RGCOPY with parameter `simulate` and check all yellow warnings.
 - RGCOPY still requires a single source resource group that contains all VMs and all disks within a single region. However, **referenced resources in different resource groups** (e.g. VNETs and NICs) are also copied.
+- Copying disks to other regions became much faster. RGCOPY can start multiple instances of AzCopy in parallel. This is much faster compared with parallel running snapshot copies.
 
 Using RGCOPY for moving SAP systems still has some limitations:
 - Nature of copy
-    - RGCOPY performs a ***copy***, not a ***move***. With a few exceptions, RGCOPY does not change anything inside the VMs like changing the server name at the OS level or applying SAP license keys.
-    - On the other hand, performing a copy allows you to test the move. The original system still exists if anything fails.
+    - RGCOPY performs a ***copy***, not a ***move***. The original system still exists if anything fails.
+    - RGCOPY does not change anything inside the VMs like changing the server name at the OS level or applying SAP license keys.
 - User Interface
     - RGCOPY is a command-line tool optimized for automation. You can change almost every property in the target (compared with the source),  resulting in about 200 RGCOPY parameters. However, RGCOPY is not integrated into Azure portal and there is no other GUI.
 - Downtime
-    - If you want to copy a productive system to a test system then the downtime is very short: You just need to stop your productive servers for creating the disk snapshots.
-    - However, for moving a system, the downtime is much longer. It includes the **time needed for snapshot copy** to a different region, deploying the new resource group and **performing manual follow-up steps** like applying license keys. 
-    - For workloads that contain a database, you might use database backups to reduce downtime: After copying the resource group using RGCOPY, you might restore the backups (full, differential, incremental, ...) of the source database on the target database. Downtime is then only needed for making and applying the last backup.
+    - If you want to *copy* a productive system to a test system then the downtime is very short: You just need to stop your productive servers for creating the disk snapshots.
+    - However, the downtime for *moving* a productive system is much longer. It includes the **time needed for copying the disks** to a different region, deploying the new resource group and **performing manual follow-up steps** like applying license keys. 
 - Support
-    - RGCOPY has been developed and is maintained by a single person. It is an open source tool, not an official Microsoft product. Microsoft Product Support will not be able to help you with RGCOPY issues, but you can see the source code since it is a PowerShell script.
-    - You can suggest future features and report bugs using GitHub Issues.
+    - RGCOPY has been developed and is maintained by a single developer. It is an Open Source tool available in GitHub, not an official Microsoft product. Microsoft Product Support will not provide support for RGCOPY. However, you can suggest future features and report bugs using GitHub Issues.
 
 ## Open Source version of RGCOPY
 RGCOPY has been released as Open Source Software (OSS) in
 - **https://github.com/Azure/RGCOPY**
 
-The documentation of the OSS version is available here:
-
-- **[https://github.com/Azure/RGCOPY/blob/main/rgcopy-docu.md](./rgcopy-docu.md)** 
-
 There also exists a Microsoft internal version of RGCOPY with additional features. It is stored in a different repository. 
+
+## Documentation
+The complete documentation is contained in file **[rgcopy-docu.md](./rgcopy-docu.md)** 
 
 ## YouTube training
 You can watch an introduction to RGCOPY on YouTube (22:35):
@@ -144,4 +139,3 @@ trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.
-
